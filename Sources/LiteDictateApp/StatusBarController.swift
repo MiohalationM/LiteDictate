@@ -168,9 +168,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         // 1. Primary action: Start / Stop Dictation
         let isActiveRecording = (snapshot.phase == .recording || snapshot.phase == .arming)
-        let toggleTitle = isActiveRecording
-            ? "停止说话 (\(snapshot.hotkey.displayString))"
-            : "开始说话 (\(snapshot.hotkey.displayString))"
+        let toggleTitle = isActiveRecording ? "停止说话" : "开始说话"
         let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(onToggleRecording), keyEquivalent: "")
         toggleItem.target = self
         menu.addItem(toggleItem)
