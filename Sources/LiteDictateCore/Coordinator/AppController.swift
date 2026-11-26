@@ -483,7 +483,7 @@ public final class AppController: @unchecked Sendable {
                   ((try? JSONDecoder().decode([String: String].self, from: aliasData)) != nil ||
                    (try? JSONDecoder().decode([AliasRule].self, from: aliasData)) != nil)
             else {
-                controllerErrorMessage = "替换词格式有误，请使用 JSON 格式（例如 {\"旧词\": \"新词\"}）"
+                controllerErrorMessage = "自动纠错词格式有误，请按 {\"错别字\": \"正确词\"} 填写"
                 controllerNoticeMessage = nil
                 projectSnapshotLocked()
                 return

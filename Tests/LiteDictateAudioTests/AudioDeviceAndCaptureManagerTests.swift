@@ -356,7 +356,7 @@ final class AudioDeviceAndCaptureManagerTests: XCTestCase {
         startGate.signal()
 
         let deadline = Date().addingTimeInterval(2.0)
-        while captureManager.hardwareState != .disposed && Date() < deadline {
+        while (captureManager.hardwareState != .disposed || captureManager.recordingState != .idle) && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.01)
         }
 

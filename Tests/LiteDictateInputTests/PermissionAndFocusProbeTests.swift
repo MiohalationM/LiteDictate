@@ -440,4 +440,19 @@ final class PermissionAndFocusProbeTests: XCTestCase {
         wait(for: [exp], timeout: 2.0)
         monitor.stopMonitoring(requestID: 1)
     }
+
+    func testLiveFocusMonitorBackendWindowComparisonIgnoresSpuriousSameWindowNotifications() {
+        let winA = "window-A" as CFString
+        let winASame = "window-A" as CFString
+        let winB = "window-B" as CFString
+
+        // Exact same window (spurious WeType / Safari / Electron notification) -> must NOT invalidate!
+        XCTAssertFalse(LiveFocusMonitorBackend.didFocusedWindowChange(initial: winA, current: winASame))
+        XCTAssertFalse(LiveFocusMonitorBackend.didFocusedWindowChange(initial: nil, current: nil))
+
+        // Different window or window closed/appeared -> MUST invalidate!
+        XCTAssertTrue(LiveFocusMonitorBackend.didFocusedWindowChange(initial: winA, current: winB))
+        XCTAssertTrue(LiveFocusMonitorBackend.didFocusedWindowChange(initial: winA, current: nil))
+        XCTAssertTrue(LiveFocusMonitorBackend.didFocusedWindowChange(initial: nil, current: winB))
+    }
 }

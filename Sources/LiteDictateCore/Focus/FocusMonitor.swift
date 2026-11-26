@@ -51,9 +51,17 @@ public protocol FocusMonitorBackend: AnyObject, Sendable {
 /// Production macOS backend attaching `AXObserver` strictly to `CFRunLoopGetMain()`.
 public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Sendable {
     private final class CallbackContext: @unchecked Sendable {
+        let appElement: AXUIElement
+        let initialFocusedWindow: AXUIElement?
         let onInvalidated: @Sendable (String) -> Void
 
-        init(onInvalidated: @escaping @Sendable (String) -> Void) {
+        init(
+            appElement: AXUIElement,
+            initialFocusedWindow: AXUIElement?,
+            onInvalidated: @escaping @Sendable (String) -> Void
+        ) {
+            self.appElement = appElement
+            self.initialFocusedWindow = initialFocusedWindow
             self.onInvalidated = onInvalidated
         }
     }
@@ -61,7 +69,6 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
     // Main-thread exclusively owned AX resources.
     private var activeObserver: AXObserver?
     private var activeAppElement: AXUIElement?
-    private var activeFocusedElement: AXUIElement?
     private var activeCallbackContext: CallbackContext?
 
     public init() {}
@@ -111,59 +118,44 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
             return AXObserverRegistrationResult(success: false, isSecureTextField: secure)
         }
 
-        let callbackCtx = CallbackContext(onInvalidated: onInvalidated)
+        // Capture initial focused window so spurious same-window IME/DOM notifications are ignored.
+        let initialFocusedWindow = Self.copyFocusedWindow(from: appElement)
+
+        let callbackCtx = CallbackContext(
+            appElement: appElement,
+            initialFocusedWindow: initialFocusedWindow,
+            onInvalidated: onInvalidated
+        )
         let refcon = Unmanaged.passUnretained(callbackCtx).toOpaque()
 
-        let focusedChangedErr = AXObserverAddNotification(
-            observer,
-            appElement,
-            kAXFocusedUIElementChangedNotification as CFString,
-            refcon
-        )
+        // Subscribe ONLY to kAXFocusedWindowChangedNotification (not kAXFocusedUIElementChangedNotification
+        // or kAXUIElementDestroyedNotification, which fire spuriously inside the same window in Electron/Safari/WeType).
         let windowChangedErr = AXObserverAddNotification(
             observer,
             appElement,
             kAXFocusedWindowChangedNotification as CFString,
             refcon
         )
-        // Best-effort registration of kAXUIElementDestroyedNotification on appElement and focused element.
-        _ = AXObserverAddNotification(
-            observer,
-            appElement,
-            kAXUIElementDestroyedNotification as CFString,
-            refcon
-        )
 
-        let focusedOK = (focusedChangedErr == .success || focusedChangedErr == .notificationAlreadyRegistered)
         let windowOK = (windowChangedErr == .success || windowChangedErr == .notificationAlreadyRegistered)
 
-        guard focusedOK && windowOK else {
-            _ = AXObserverRemoveNotification(observer, appElement, kAXFocusedUIElementChangedNotification as CFString)
+        guard windowOK else {
             _ = AXObserverRemoveNotification(observer, appElement, kAXFocusedWindowChangedNotification as CFString)
-            _ = AXObserverRemoveNotification(observer, appElement, kAXUIElementDestroyedNotification as CFString)
             let secure = isCurrentFocusedElementSecureTextField(timeoutSeconds: timeoutSeconds)
             return AXObserverRegistrationResult(success: false, isSecureTextField: secure)
         }
 
         var isSecure = IsSecureEventInputEnabled()
-        var focusedElement: AXUIElement?
-        var focusedValue: CFTypeRef?
-        let focusedQueryErr = AXUIElementCopyAttributeValue(
-            appElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        )
-        if focusedQueryErr == .success, let focusedValue, CFGetTypeID(focusedValue) == AXUIElementGetTypeID() {
-            let element = (focusedValue as! AXUIElement)
-            AXUIElementSetMessagingTimeout(element, timeoutSeconds)
-            focusedElement = element
-            _ = AXObserverAddNotification(
-                observer,
-                element,
-                kAXUIElementDestroyedNotification as CFString,
-                refcon
+        if !isSecure {
+            var focusedValue: CFTypeRef?
+            let focusedQueryErr = AXUIElementCopyAttributeValue(
+                appElement,
+                kAXFocusedUIElementAttribute as CFString,
+                &focusedValue
             )
-            if !isSecure {
+            if focusedQueryErr == .success, let focusedValue, CFGetTypeID(focusedValue) == AXUIElementGetTypeID() {
+                let element = (focusedValue as! AXUIElement)
+                AXUIElementSetMessagingTimeout(element, timeoutSeconds)
                 isSecure = Self.isElementSecureTextField(element)
             }
         }
@@ -173,7 +165,6 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
 
         activeObserver = observer
         activeAppElement = appElement
-        activeFocusedElement = focusedElement
         activeCallbackContext = callbackCtx
 
         return AXObserverRegistrationResult(success: true, isSecureTextField: isSecure)
@@ -184,12 +175,7 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
 
         if let observer = activeObserver {
             if let appElement = activeAppElement {
-                _ = AXObserverRemoveNotification(observer, appElement, kAXFocusedUIElementChangedNotification as CFString)
                 _ = AXObserverRemoveNotification(observer, appElement, kAXFocusedWindowChangedNotification as CFString)
-                _ = AXObserverRemoveNotification(observer, appElement, kAXUIElementDestroyedNotification as CFString)
-            }
-            if let focusedElement = activeFocusedElement {
-                _ = AXObserverRemoveNotification(observer, focusedElement, kAXUIElementDestroyedNotification as CFString)
             }
             let source = AXObserverGetRunLoopSource(observer)
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
@@ -197,7 +183,6 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
 
         activeObserver = nil
         activeAppElement = nil
-        activeFocusedElement = nil
         activeCallbackContext = nil
     }
 
@@ -226,6 +211,34 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
         return Self.isElementSecureTextField(element)
     }
 
+    /// Compares initial and current focused window references using `CFEqual`.
+    /// Returns `false` when the focused window is unchanged (spurious IME/popover/DOM notification).
+    public static func didFocusedWindowChange(initial: CFTypeRef?, current: CFTypeRef?) -> Bool {
+        switch (initial, current) {
+        case (nil, nil):
+            return false
+        case let (lhs?, rhs?):
+            return !CFEqual(lhs, rhs)
+        default:
+            return true
+        }
+    }
+
+    private static func copyFocusedWindow(from appElement: AXUIElement) -> AXUIElement? {
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedWindowAttribute as CFString,
+            &windowValue
+        ) == .success,
+              let windowValue,
+              CFGetTypeID(windowValue) == AXUIElementGetTypeID()
+        else {
+            return nil
+        }
+        return (windowValue as! AXUIElement)
+    }
+
     /// Checks ONLY `kAXRoleAttribute` and `kAXSubroleAttribute` for `"AXSecureTextField"`.
     /// Strictly respects WeType 5 red lines: NEVER queries `kAXMarkedTextRangeAttribute`.
     private static func isElementSecureTextField(_ element: AXUIElement) -> Bool {
@@ -251,6 +264,14 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
     private static let axObserverCallback: AXObserverCallback = { _, _, notification, refcon in
         guard let refcon else { return }
         let ctx = Unmanaged<CallbackContext>.fromOpaque(refcon).takeUnretainedValue()
+        let currentWindow = LiveFocusMonitorBackend.copyFocusedWindow(from: ctx.appElement)
+        guard LiveFocusMonitorBackend.didFocusedWindowChange(
+            initial: ctx.initialFocusedWindow,
+            current: currentWindow
+        ) else {
+            // Spurious notification while still inside the exact same window — ignore.
+            return
+        }
         let reason = notification as String
         ctx.onInvalidated(reason)
     }

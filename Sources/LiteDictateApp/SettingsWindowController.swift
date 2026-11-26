@@ -681,7 +681,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let (vocabText, aliasesJSON) = loadVocabAndAliases()
         hasUnsavedDictEdits = false
 
-        let dictHeader = NSTextField(labelWithString: "常用热词（左，每行一个，最多 50 词）与自动纠错替换（右，JSON 格式）")
+        let dictHeader = NSTextField(labelWithString: "常用词（左，每行一个，最多 50 个）与自动纠错词（右，如 {\"错别字\": \"正确词\"}）")
         dictHeader.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         root.addArrangedSubview(dictHeader)
 

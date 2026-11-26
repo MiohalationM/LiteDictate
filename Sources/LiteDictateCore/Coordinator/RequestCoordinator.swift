@@ -949,7 +949,7 @@ public final class RequestCoordinator: @unchecked Sendable {
             enterRecoveryWithTextLocked(text: text, reason: "刚刚切换了窗口，文字已为你安全保留", keepRetainedPCM: false)
             return
         }
-        if !focus.axInitialized {
+        if config.inputMode == .clipboardCompatibility && !focus.axInitialized {
             focusMonitor.stopMonitoring(requestID: requestID)
             enterRecoveryWithTextLocked(text: text, reason: "当前窗口暂不支持自动输入，文字已为你安全保留", keepRetainedPCM: false)
             return
@@ -1248,10 +1248,12 @@ public final class RequestCoordinator: @unchecked Sendable {
         guard requestID == activeRequestID && phase == .revalidating else {
             return "本次输入已取消"
         }
-        // 2. focusGeneration unchanged, target pid+launchDate match, AND axInitialized == true
+        // 2. focusGeneration unchanged, target pid+launchDate match;
+        //    in directTyping mode do NOT block solely on `!focus.axInitialized` because
+        //    Tier 2 direct Unicode typing works without AXObserver.
         guard focusMonitor.currentFocusGeneration == focus.focusGeneration,
               focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate),
-              focus.axInitialized
+              (config.inputMode == .directTyping || focus.axInitialized)
         else {
             return "刚刚切换了窗口，文字已为你安全保留"
         }

@@ -24,8 +24,8 @@ public enum WorkerLifecycleState: String, Codable, Equatable, Sendable {
 
     public var displayTitle: String {
         switch self {
-        case .stopped: return "待命中（零模型占用）"
-        case .starting: return "正在唤醒语音引擎"
+        case .stopped: return "待命中"
+        case .starting: return "正在准备语音模型"
         case .warmModel: return "已就绪"
         case .busy: return "正在识别"
         case .cancelling: return "正在取消"

@@ -42,6 +42,7 @@ public protocol AXFocusedTextSession: AnyObject, Sendable {
     var elementPID: pid_t? { get }
     var role: String? { get }
     var subrole: String? { get }
+    var isWebBackedElement: Bool { get }
     var isSelectedTextSettable: Bool { get }
 
     func readSelectedRange() -> CFRange?
@@ -94,6 +95,22 @@ public final class LiveAXFocusedTextSession: AXFocusedTextSession, @unchecked Se
 
     public var subrole: String? {
         copyStringAttribute(kAXSubroleAttribute as CFString)
+    }
+
+    /// Detects WebKit/WebView-backed fields (even embedded inside Mail or Notes) via `AXDOMIdentifier` / `AXURL`.
+    public var isWebBackedElement: Bool {
+        if role == "AXWebArea" {
+            return true
+        }
+        var domID: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXDOMIdentifier" as CFString, &domID) == .success, domID != nil {
+            return true
+        }
+        var urlVal: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXURL" as CFString, &urlVal) == .success, urlVal != nil {
+            return true
+        }
+        return false
     }
 
     public var isSelectedTextSettable: Bool {
@@ -267,11 +284,14 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
             return .unverifiedOrSkipped
         }
 
-        // Role & subrole safety check (block secure fields; skip web areas / non-native text views).
+        // Role & subrole safety check (block secure fields; skip WebViews / non-native text views).
         let role = session.role
         let subrole = session.subrole
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
             return .secureTextFieldBlocked
+        }
+        if session.isWebBackedElement {
+            return .unverifiedOrSkipped
         }
         guard let role, role != "AXWebArea", Self.allowedNativeTextRoles.contains(role) else {
             return .unverifiedOrSkipped
@@ -390,23 +410,25 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
 
 /// Production Tier 2 Unicode keystroke poster gated on `CGPreflightPostEventAccess()` (P0-1),
 /// using `.privateState`, empty modifier flags, empirically verified inert virtual key (`0x00FF`,
-/// never `0x0000`/`kVK_ANSI_A`), `CGEventKeyboardSetUnicodeString`, and `0x4C444943` ("LDIC") userData
-/// on BOTH `keyDown` & `keyUp`.
+/// never `0x0000`/`kVK_ANSI_A`), `CGEventKeyboardSetUnicodeString` ONLY on `keyDown`,
+/// `0x4C444943` ("LDIC") userData on BOTH `keyDown` & `keyUp`, and a `0.25 ms` down-to-up gap.
 public final class LiveUnicodeKeystrokePoster: UnicodeKeystrokePosting, Sendable {
+    public static let defaultKeyDownToUpDelayNs: UInt64 = 250_000 // 0.25 ms
+
     private let postEventAccessProbe: @Sendable () -> Bool
+    private let keyDownToUpDelayNs: UInt64
 
     public init(
-        postEventAccessProbe: @escaping @Sendable () -> Bool = { CGPreflightPostEventAccess() }
+        postEventAccessProbe: @escaping @Sendable () -> Bool = { CGPreflightPostEventAccess() },
+        keyDownToUpDelayNs: UInt64 = defaultKeyDownToUpDelayNs
     ) {
         self.postEventAccessProbe = postEventAccessProbe
+        self.keyDownToUpDelayNs = keyDownToUpDelayNs
     }
 
-    public func postKeystroke(_ event: DirectKeystrokeEvent) -> Bool {
-        // P0-1: Never blindly post synthetic events when post-event TCC permission is denied.
-        guard postEventAccessProbe() else {
-            return false
-        }
-
+    /// Constructs the exact `(keyDown, keyUp)` `CGEvent` pair posted for `event`.
+    /// Attaches `keyboardSetUnicodeString` ONLY to `keyDown`, leaving `keyUp` clean.
+    public static func makeKeyEventPair(for event: DirectKeystrokeEvent) -> (keyDown: CGEvent, keyUp: CGEvent)? {
         guard let source = CGEventSource(stateID: .privateState),
               let keyDown = CGEvent(
                   keyboardEventSource: source,
@@ -419,7 +441,7 @@ public final class LiveUnicodeKeystrokePoster: UnicodeKeystrokePosting, Sendable
                   keyDown: false
               )
         else {
-            return false
+            return nil
         }
 
         let flags = CGEventFlags(rawValue: event.flagsRawValue)
@@ -431,12 +453,28 @@ public final class LiveUnicodeKeystrokePoster: UnicodeKeystrokePosting, Sendable
 
         if case let .unicode(utf16Units, _, _, _) = event {
             utf16Units.withUnsafeBufferPointer { buffer in
+                // Attach Unicode payload ONLY on keyDown so Electron/WebKit never double-handle or drop keyUp.
                 keyDown.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
-                keyUp.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
             }
         }
 
+        return (keyDown, keyUp)
+    }
+
+    public func postKeystroke(_ event: DirectKeystrokeEvent) -> Bool {
+        // P0-1: Never blindly post synthetic events when post-event TCC permission is denied.
+        guard postEventAccessProbe() else {
+            return false
+        }
+
+        guard let (keyDown, keyUp) = Self.makeKeyEventPair(for: event) else {
+            return false
+        }
+
         keyDown.post(tap: .cgSessionEventTap)
+        if keyDownToUpDelayNs > 0 {
+            DirectTextInjector.sleepNanoseconds(keyDownToUpDelayNs)
+        }
         keyUp.post(tap: .cgSessionEventTap)
         return true
     }
@@ -471,53 +509,15 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
     public static let longTextPacingDelayNs: UInt64 = 1_000_000 // 1.0 ms for > 60 chunks
     public static let longTextChunkThreshold: Int = 60
 
-    /// Known AX-unreliable apps where Tier 1 (`kAXSelectedTextAttribute`) is skipped directly to Tier 2.
-    public static let axUnreliableBundleIDs: Set<String> = [
-        // Electron / Code Editors
-        "com.microsoft.vscode",
-        "com.microsoft.vscodeinsiders",
-        "com.vscodium.vscodium",
-        "com.todesktop.230313mzl4w4u92", // Cursor
-        "com.cursor.cursor",
-        "com.exafunction.windsurf",
-        "dev.zed.zed",
-        "com.zed.zed",
-        "com.sublimetext.4",
-        "com.sublimetext.3",
-        "dev.t3.code",
-        "com.t3.code",
-        "com.t3code.app",
-        // Chromium / Web Browsers
-        "com.google.chrome",
-        "com.google.chrome.canary",
-        "com.google.chrome.beta",
-        "org.chromium.chromium",
-        "company.thebrowser.browser", // Arc
-        "company.thebrowser.dia",
-        "com.brave.browser",
-        "com.brave.browser.beta",
-        "com.microsoft.edgemac",
-        "com.microsoft.edgemac.beta",
-        "com.vivaldi.vivaldi",
-        "com.operasoftware.opera",
-        "org.mozilla.firefox",
-        "org.mozilla.firefoxdeveloperedition",
-        // Electron / Cross-Platform Chat & Productivity
-        "com.tinyspeck.slackmacgap",
-        "notion.id",
-        "com.hnc.discord",
-        "md.obsidian",
-        "com.linear",
-        "com.figma.desktop",
-        "com.tencent.xinwechat", // WeChat
-        "com.tencent.weworkmac", // WeCom
-        "com.tencent.qq",
-        "com.electron.lark",
-        "com.bytedance.feishu",
-        "com.alibaba.dingtalkmac",
-        "ru.keepcoder.telegram",
-        "com.whatsapp.desktop",
-        "com.microsoft.teams2",
+    /// Strict verified pure-AppKit allowlist eligible for Tier 1 (`kAXSelectedTextAttribute`).
+    /// All browsers (Safari/Chrome/Arc/Firefox), Electron apps (VS Code/Cursor/Vulcan Code/T3 Code/Slack/Notion),
+    /// WeChat, Terminals, JetBrains, and unknown apps skip Tier 1 directly to Tier 2 Unicode keystroke stream.
+    public static let axAllowlistedBundleIDs: Set<String> = [
+        "com.apple.textedit",
+        "com.apple.notes",
+        "com.apple.mail",
+        "com.apple.iwork.pages",
+        "com.apple.mobilesms",
     ]
 
     public struct KeystrokeChunk: Equatable, Sendable {
@@ -595,24 +595,12 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
     }
 
     /// Returns `true` when Tier 1 (`kAXSelectedTextAttribute`) must be skipped in favor of Tier 2.
+    /// Uses a strict pure-AppKit allowlist (`axAllowlistedBundleIDs`).
     public func shouldSkipAccessibilityTier(bundleIdentifier: String?) -> Bool {
         guard let bundleIdentifier, !bundleIdentifier.isEmpty else {
             return true
         }
-        let lower = bundleIdentifier.lowercased()
-        if terminalBundleIDs.contains(lower) {
-            return true
-        }
-        if Self.axUnreliableBundleIDs.contains(lower) {
-            return true
-        }
-        if lower.hasPrefix("com.jetbrains.") {
-            return true
-        }
-        if lower.contains("electron") || lower.contains("t3code") || lower.contains("t3.code") || lower.contains("t3-code") {
-            return true
-        }
-        return false
+        return !Self.axAllowlistedBundleIDs.contains(bundleIdentifier.lowercased())
     }
 
     /// Splits `text` into safe 1–2 UTF-16 code-unit keystroke chunks preserving surrogate pairs (e.g. emoji)
@@ -865,7 +853,7 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
         }
     }
 
-    private static func sleepNanoseconds(_ ns: UInt64) {
+    static func sleepNanoseconds(_ ns: UInt64) {
         var req = timespec(
             tv_sec: Int(ns / 1_000_000_000),
             tv_nsec: Int(ns % 1_000_000_000)

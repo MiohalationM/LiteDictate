@@ -532,7 +532,7 @@ struct AppControllerTests {
         controller.dispatch(.saveVocabularyAndAliases(vocabText: "Ignored", aliasesJSON: "{not valid json"))
         try? await Task.sleep(for: .milliseconds(40))
         let errSnap = await MainActor.run { store.snapshot }
-        #expect(errSnap.lastErrorMessage?.contains("JSON") == true)
+        #expect(errSnap.lastErrorMessage?.contains("自动纠错词格式有误") == true)
         #expect(controller.loadVocabularyAndAliasesText().aliasesJSON.contains("LightDictate"))
 
         let opened = openedURLs.snapshot().map(\.lastPathComponent)

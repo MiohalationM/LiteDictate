@@ -1232,4 +1232,135 @@ struct RequestCoordinatorTests {
         #expect(h.coordinator.currentSnapshotDelta().phase == .idle)
         #expect(h.coordinator.currentSnapshotDelta().lastErrorMessage?.contains("麦克风权限") == true)
     }
+
+    @Test("Direct typing succeeds when AXObserver axInitialized is false, while still enforcing focus, frontmost, and secure guards")
+    func testDirectTypingDoesNotBlockOnAXInitializedFalse() async throws {
+        // 1. Direct typing with axInitialized == false succeeds cleanly
+        do {
+            let h = try CoordinatorHarness(inputMode: .directTyping)
+            defer { h.cleanup() }
+            h.focus.setFrontmost(pid: 500, bundleID: "ai.vulcan.code.desktop", secure: false, axOk: false)
+
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            let capID = try #require(h.audio.startedIdentities.first)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.worker.completeLastTranscription(text: "Hello Swift UI")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+
+            #expect(h.direct.insertedTexts == ["Hello SwiftUI"])
+            #expect(h.clipboard.preparePasteCallCount == 0)
+            #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+        }
+
+        // 2. Direct typing with axInitialized == false STILL blocks if focusGeneration changed
+        do {
+            let h = try CoordinatorHarness(inputMode: .directTyping)
+            defer { h.cleanup() }
+            h.focus.setFrontmost(pid: 500, bundleID: "ai.vulcan.code.desktop", secure: false, axOk: false)
+
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            h.focus.invalidateFocus(reason: "switched window")
+            let capID = try #require(h.audio.startedIdentities.first)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.worker.completeLastTranscription(text: "Should stay in recovery")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+
+            #expect(h.direct.insertedTexts.isEmpty)
+            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Should stay in recovery")
+        }
+
+        // 3. Direct typing with axInitialized == false STILL blocks if frontmost PID changed
+        do {
+            let h = try CoordinatorHarness(inputMode: .directTyping)
+            defer { h.cleanup() }
+            h.focus.setFrontmost(pid: 500, bundleID: "ai.vulcan.code.desktop", secure: false, axOk: false)
+
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            let capID = try #require(h.audio.startedIdentities.first)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.focus.setFrontmost(pid: 777, bundleID: "com.apple.Safari", secure: false, axOk: false)
+            h.worker.completeLastTranscription(text: "Wrong frontmost app")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+
+            #expect(h.direct.insertedTexts.isEmpty)
+            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Wrong frontmost app")
+        }
+
+        // 4. Direct typing with axInitialized == false STILL blocks if secure text field is active
+        do {
+            let h = try CoordinatorHarness(inputMode: .directTyping)
+            defer { h.cleanup() }
+            h.focus.setFrontmost(pid: 500, bundleID: "ai.vulcan.code.desktop", secure: true, axOk: false)
+
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            let capID = try #require(h.audio.startedIdentities.first)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.worker.completeLastTranscription(text: "Password field text")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+
+            #expect(h.direct.insertedTexts.isEmpty)
+            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Password field text")
+        }
+
+        // 5. Clipboard compatibility mode STILL requires axInitialized == true
+        do {
+            let h = try CoordinatorHarness(inputMode: .clipboardCompatibility)
+            defer { h.cleanup() }
+            h.focus.setFrontmost(pid: 500, bundleID: "com.example.LegacyApp", secure: false, axOk: false)
+
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            let capID = try #require(h.audio.startedIdentities.first)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.worker.completeLastTranscription(text: "Legacy app fallback")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+
+            #expect(h.clipboard.preparePasteCallCount == 0)
+            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Legacy app fallback")
+        }
+    }
 }

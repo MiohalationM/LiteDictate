@@ -50,6 +50,7 @@ private final class MockAXFocusedTextSession: AXFocusedTextSession, @unchecked S
     var _elementPID: pid_t? = 1234
     var _role: String? = "AXTextArea"
     var _subrole: String?
+    var _isWebBackedElement: Bool = false
     var _isSelectedTextSettable: Bool = true
     var _value: String = "Hello "
     var _selectedRange: CFRange = CFRange(location: 6, length: 0)
@@ -76,6 +77,12 @@ private final class MockAXFocusedTextSession: AXFocusedTextSession, @unchecked S
         lock.lock()
         defer { lock.unlock() }
         return _subrole
+    }
+
+    var isWebBackedElement: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isWebBackedElement
     }
 
     var isSelectedTextSettable: Bool {
@@ -190,19 +197,32 @@ final class DirectTextInjectorTests: XCTestCase {
         return box.value!
     }
 
-    func testVerifiedAXInsertSucceedsOnNativeAppWithZeroKeystrokes() {
-        let ax = MockAXDirectInserter()
-        ax.result = .verified
-        let poster = RecordingUnicodeKeystrokePoster()
-        let injector = makeInjector(axInserter: ax, poster: poster)
+    func testVerifiedAXInsertSucceedsOnAllowlistedNativeAppsWithZeroKeystrokes() {
+        for allowlistedBundle in ["com.apple.TextEdit", "com.apple.Notes", "com.apple.mail", "com.apple.iWork.Pages", "com.apple.MobileSMS"] {
+            let ax = MockAXDirectInserter()
+            ax.result = .verified
+            let poster = RecordingUnicodeKeystrokePoster()
+            let injector = makeInjector(axInserter: ax, poster: poster)
 
-        let outcome = syncInsert(injector, text: "言落直接输入", targetBundleID: "com.apple.Notes")
-        XCTAssertEqual(outcome, .inserted(method: .verifiedAccessibility))
-        XCTAssertEqual(ax.callCount, 1)
-        XCTAssertEqual(ax.lastText, "言落直接输入")
-        XCTAssertEqual(ax.lastPID, 1234)
-        XCTAssertEqual(ax.lastTimeoutSeconds, 0.15, accuracy: 0.001)
-        XCTAssertTrue(poster.eventsSnapshot().isEmpty, "Tier 1 success must emit ZERO Unicode keystrokes")
+            let outcome = syncInsert(injector, text: "言落直接输入", targetBundleID: allowlistedBundle)
+            XCTAssertEqual(outcome, .inserted(method: .verifiedAccessibility), "Expected Tier 1 for \(allowlistedBundle)")
+            XCTAssertEqual(ax.callCount, 1)
+            XCTAssertEqual(ax.lastText, "言落直接输入")
+            XCTAssertEqual(ax.lastPID, 1234)
+            XCTAssertEqual(ax.lastTimeoutSeconds, 0.15, accuracy: 0.001)
+            XCTAssertTrue(poster.eventsSnapshot().isEmpty, "Tier 1 success must emit ZERO Unicode keystrokes")
+        }
+
+        // Embedded WebView inside an allowlisted app (e.g. Mail/Notes with AXDOMIdentifier/AXURL) MUST skip Tier 1!
+        let webSession = MockAXFocusedTextSession()
+        webSession._isWebBackedElement = true
+        let liveAX = LiveAXDirectInserter(isProcessTrusted: { true }, sessionProvider: { _ in webSession })
+        let poster = RecordingUnicodeKeystrokePoster()
+        let injector = makeInjector(axInserter: liveAX, poster: poster)
+        let webOutcome = syncInsert(injector, text: "Hi", targetBundleID: "com.apple.mail")
+        XCTAssertEqual(webOutcome, .inserted(method: .unicodeKeystrokeStream))
+        XCTAssertEqual(webSession.setSelectedTextCallCount, 0, "Web-backed element inside Mail must skip AX write")
+        XCTAssertEqual(poster.eventsSnapshot().count, 2)
     }
 
     func testAXFalseSuccessIsCaughtAndFallsBackToUnicodeKeystrokeStream() {
@@ -276,8 +296,13 @@ final class DirectTextInjectorTests: XCTestCase {
         XCTAssertEqual(poster.eventsSnapshot().count, 2)
     }
 
-    func testKnownAXUnreliableAppsSkipTier1DirectlyToUnicodeStream() {
-        let unreliableBundles = [
+    func testNonAllowlistedAppsIncludingSafariVulcanCodeAndUnknownSkipTier1DirectlyToUnicodeStream() {
+        let nonAllowlistedBundles = [
+            "com.apple.Safari",
+            "ai.vulcan.code.desktop",
+            "com.amazon.QuickWork.mac",
+            "com.openai.chat",
+            "com.unknown.ThirdPartyApp",
             "com.apple.Terminal",
             "com.mitchellh.ghostty",
             "com.microsoft.VSCode",
@@ -296,7 +321,7 @@ final class DirectTextInjectorTests: XCTestCase {
             nil,
         ]
 
-        for bundleID in unreliableBundles {
+        for bundleID in nonAllowlistedBundles {
             let ax = MockAXDirectInserter()
             ax.result = .verified
             let poster = RecordingUnicodeKeystrokePoster()
@@ -568,30 +593,37 @@ final class DirectTextInjectorTests: XCTestCase {
         XCTAssertTrue(poster.eventsSnapshot().isEmpty, "MUST NEVER fall through to Tier 2 double-typing after AX write")
     }
 
-    func testLiveCGEventWithInertVirtualKeyAndEmojiCreatesValidNonAEvent() {
-        let source = CGEventSource(stateID: .privateState)
-        XCTAssertNotNil(source)
-
-        var emojiUTF16 = Array("🚀".utf16)
-        guard let ev = CGEvent(
-            keyboardEventSource: source,
-            virtualKey: CGKeyCode(DirectTextInjector.inertUnicodeVirtualKey),
-            keyDown: true
-        ) else {
-            return XCTFail("Failed to create CGEvent")
+    func testLiveUnicodeKeystrokePosterAttachesUnicodeStringOnlyOnKeyDown() {
+        let emojiUnits = Array("🚀".utf16)
+        let event = DirectKeystrokeEvent.unicode(
+            utf16Units: emojiUnits,
+            virtualKey: DirectTextInjector.inertUnicodeVirtualKey,
+            flagsRawValue: 0,
+            userData: LiteDictateConstants.syntheticEventUserData
+        )
+        guard let (keyDown, keyUp) = LiveUnicodeKeystrokePoster.makeKeyEventPair(for: event) else {
+            return XCTFail("Failed to construct CGEvent pair")
         }
-        ev.flags = []
-        ev.setIntegerValueField(.eventSourceUserData, value: LiteDictateConstants.syntheticEventUserData)
-        ev.keyboardSetUnicodeString(stringLength: emojiUTF16.count, unicodeString: &emojiUTF16)
 
-        XCTAssertEqual(ev.getIntegerValueField(.keyboardEventKeycode), Int64(DirectTextInjector.inertUnicodeVirtualKey))
-        XCTAssertNotEqual(ev.getIntegerValueField(.keyboardEventKeycode), 0)
-        XCTAssertEqual(ev.getIntegerValueField(.eventSourceUserData), 0x4C444943)
-        XCTAssertEqual(ev.flags, [])
+        // keyDown carries full Unicode string, inert non-0x00 virtualKey, empty flags, LDIC userData
+        XCTAssertEqual(keyDown.getIntegerValueField(.keyboardEventKeycode), Int64(DirectTextInjector.inertUnicodeVirtualKey))
+        XCTAssertNotEqual(keyDown.getIntegerValueField(.keyboardEventKeycode), 0)
+        XCTAssertEqual(keyDown.getIntegerValueField(.eventSourceUserData), 0x4C444943)
+        XCTAssertEqual(keyDown.flags, [])
 
-        var outLen = 0
-        var outBuf = [UniChar](repeating: 0, count: 4)
-        ev.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &outLen, unicodeString: &outBuf)
-        XCTAssertEqual(String(utf16CodeUnits: outBuf, count: outLen), "🚀")
+        var downLen = 0
+        var downBuf = [UniChar](repeating: 0, count: 4)
+        keyDown.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &downLen, unicodeString: &downBuf)
+        XCTAssertEqual(String(utf16CodeUnits: downBuf, count: downLen), "🚀")
+
+        // keyUp MUST NOT carry a Unicode string (prevents Electron/WebKit duplication or dropped events)
+        XCTAssertEqual(keyUp.getIntegerValueField(.keyboardEventKeycode), Int64(DirectTextInjector.inertUnicodeVirtualKey))
+        XCTAssertEqual(keyUp.getIntegerValueField(.eventSourceUserData), 0x4C444943)
+        XCTAssertEqual(keyUp.flags, [])
+
+        var upLen = 0
+        var upBuf = [UniChar](repeating: 0, count: 4)
+        keyUp.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &upLen, unicodeString: &upBuf)
+        XCTAssertEqual(upLen, 0, "keyUp MUST NOT have keyboardSetUnicodeString attached")
     }
 }

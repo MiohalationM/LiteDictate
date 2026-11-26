@@ -209,9 +209,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         // 1. Friendly Status Header
         let statusLine: String
         if snapshot.memoryPressure == .critical {
-            statusLine = "言落 · 系统内存紧张，已暂停后台引擎"
+            statusLine = "言落 · 系统内存紧张，已暂时暂停识别"
         } else if snapshot.workerState == .stopped {
-            statusLine = "言落 · 待命中（零模型占用）"
+            statusLine = "言落 · 待命中（未占用模型内存）"
         } else if snapshot.workerState == .warmModel {
             statusLine = "言落 · 已就绪（模型待机中）"
         } else {

@@ -25,8 +25,8 @@ public enum ModelRegistryError: Error, Equatable, Sendable {
             return "复制模型文件失败：\(msg)"
         case let .probeFailed(err):
             return err.userMessage
-        case let .modelNotRegistered(id):
-            return "未找到已注册模型：\(id)"
+        case .modelNotRegistered:
+            return "尚未选择可用的语音模型，请先在偏好设置中导入"
         }
     }
 }
