@@ -95,8 +95,11 @@ Benchmarked on Apple M1 · 8 GB unified RAM · macOS 14+ · `Qwen3-ASR-0.6B-Q8_0
 ## Quick Start
 
 1. Download `LiteDictate-1.1.0-arm64.dmg` from [Releases](https://github.com/MiohalationM/LiteDictate/releases/latest) and drag **LiteDictate** into **Applications**.
-2. Click the menu bar icon to grant **Microphone**, **Accessibility**, and **Input Monitoring** permissions, then import a local `.gguf` speech model.
-3. **Hold Right `⌘`** anywhere to speak and release to insert text (press `Esc` to cancel).
+2. Download the recommended offline speech model **`Qwen3-ASR-0.6B-Q8_0.gguf`** (~811 MB, 30 languages + auto language detection):
+   - **Global Direct Download (Hugging Face)**: [Download Qwen3-ASR-0.6B-Q8_0.gguf](https://huggingface.co/lipik/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf?download=true)
+   - **Mainland China Mirror (HF-Mirror)**: [Download Qwen3-ASR-0.6B-Q8_0.gguf](https://hf-mirror.com/lipik/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf?download=true)
+3. Click the menu bar icon to grant **Microphone**, **Accessibility**, and **Input Monitoring** permissions, then import the `.gguf` file in **Preferences → Models** (or drop it into `~/Library/Application Support/LiteDictate/models/` for automatic detection).
+4. **Hold Right `⌘`** anywhere to speak and release to insert text (press `Esc` to cancel).
 
 > **First launch**: If macOS Gatekeeper warns about an unnotarized open-source build, run once in Terminal:
 > ```bash

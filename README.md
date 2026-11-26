@@ -97,8 +97,11 @@
 ## 快速开始
 
 1. 前往 [Releases](https://github.com/MiohalationM/LiteDictate/releases/latest) 下载 `LiteDictate-1.1.0-arm64.dmg`，打开后将 **LiteDictate** 拖入「应用程序」。
-2. 启动后点击顶部菜单栏图标，按引导授予**麦克风**、**辅助功能**与**输入监控**权限，并导入一个本地 `.gguf` 语音模型（如 `Qwen3-ASR-0.6B-Q8_0.gguf` 或 `ggml-large-v3-turbo`）。
-3. 在任意输入框中**按住右 `⌘`** 说话，松开即自动输入；随时按 `Esc` 取消。
+2. 下载推荐离线语音模型 **`Qwen3-ASR-0.6B-Q8_0.gguf`**（约 811 MB，支持中英日韩等 30 种语言与自动语种识别）：
+   - **海外直链（Hugging Face）**：[点击直接下载 Qwen3-ASR-0.6B-Q8_0.gguf](https://huggingface.co/lipik/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf?download=true)
+   - **中国大陆下载直链（HF-Mirror）**：[点击直接下载 Qwen3-ASR-0.6B-Q8_0.gguf](https://hf-mirror.com/lipik/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf?download=true)
+3. 启动言落后点击顶部菜单栏图标，按引导授予**麦克风**、**辅助功能**与**输入监控**权限，并在「偏好设置 → 语音模型」中导入刚刚下载的 `.gguf` 文件（或直接放到 `~/Library/Application Support/LiteDictate/models/`，启动时会自动识别）。
+4. 在任意输入框中**按住右 `⌘`** 说话，松开即自动输入；随时按 `Esc` 取消。
 
 > **首次打开提示**：若因未公证遇到 macOS 提示“无法验证开发者”，在终端执行一次以下命令即可：
 > ```bash
