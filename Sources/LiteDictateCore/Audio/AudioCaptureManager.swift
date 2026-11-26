@@ -965,9 +965,9 @@ public final class AudioCaptureManager: AudioCapturing, @unchecked Sendable {
     // MARK: - Timers & Consumer Thread Spawning
 
     private func startSessionTimers(for session: ActiveSession) {
-        // 15 Hz (~66 ms) lock-free telemetry & UI meter readout timer.
+        // 30 Hz (~33 ms) lock-free telemetry & UI meter readout timer (active ONLY while recording).
         let meterTimer = DispatchSource.makeTimerSource(queue: controlQueue)
-        meterTimer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(66), leeway: .milliseconds(5))
+        meterTimer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(33), leeway: .milliseconds(4))
         meterTimer.setEventHandler { [weak self, weak session] in
             guard let self, let session, self.activeSession === session else { return }
             self.pollTelemetryOnControlQueue(session: session)

@@ -18,8 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyController = HotkeyController()
         let permissionManager = PermissionManager()
         let focusMonitor = FocusMonitor()
-        let directInjector = DirectTextInjector()
         let clipboardInjector = ClipboardInjector()
+        let directInjector = DirectTextInjector(clipboardFallback: clipboardInjector)
         let workerSupervisor = WorkerSupervisor()
 
         let controller = AppController(

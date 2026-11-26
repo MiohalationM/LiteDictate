@@ -654,4 +654,34 @@ final class ClipboardInjectorTests: XCTestCase {
         XCTAssertTrue(ClipboardInjector.wouldExceedSnapshotBudget(currentBytes: budget - 10, addingBytes: 11, budgetBytes: budget))
         XCTAssertTrue(ClipboardInjector.wouldExceedSnapshotBudget(currentBytes: 0, addingBytes: -1, budgetBytes: budget))
     }
+
+    func testCommonBrowserAndEditorClipboardCompanionTypesSnapshotAndRestoreCleanly() {
+        let (injector, pb, poster) = makeInjector()
+        let vscodeData = Data("{\"mode\":\"swift\"}".utf8)
+        let webCustom = Data([0x01, 0x02, 0x03, 0x04])
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: ClipboardInjector.PasteboardMarkerType.utf8String, data: Data("let x = 1".utf8)),
+                (type: "NSStringPboardType", data: Data("let x = 1".utf8)),
+                (type: "org.chromium.web-custom-data", data: webCustom),
+                (type: "Apple HTML pasteboard type", data: Data("<pre>let x = 1</pre>".utf8)),
+                (type: "dyn.ah62d4rv4gu8y6y4grf0gn5xbrzw1gydcr7u1e3cytf2gn", data: vscodeData),
+            ]),
+        ])
+
+        guard case let .ready(prep) = syncPrepare(injector, text: "语音输入测试", targetBundleID: "com.microsoft.VSCode") else {
+            return XCTFail("Expected browser/editor text copy with companion metadata to snapshot cleanly")
+        }
+        XCTAssertTrue(syncDispatch(injector, preparation: prep, restoreDelayMs: 25))
+        XCTAssertEqual(poster.postedSpecs.count, 1)
+
+        let idleExp = expectation(description: "restored browser/editor clipboard")
+        injector.whenIdle { idleExp.fulfill() }
+        wait(for: [idleExp], timeout: 2.0)
+
+        XCTAssertEqual(pb.currentUTF8String(), "let x = 1")
+        let restoredTypes = Set(pb.currentItems().first?.representations.map(\.type) ?? [])
+        XCTAssertTrue(restoredTypes.contains("org.chromium.web-custom-data"))
+        XCTAssertTrue(restoredTypes.contains("dyn.ah62d4rv4gu8y6y4grf0gn5xbrzw1gydcr7u1e3cytf2gn"))
+    }
 }

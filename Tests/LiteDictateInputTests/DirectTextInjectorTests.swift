@@ -197,15 +197,15 @@ final class DirectTextInjectorTests: XCTestCase {
         return box.value!
     }
 
-    func testVerifiedAXInsertSucceedsOnAllowlistedNativeAppsWithZeroKeystrokes() {
-        for allowlistedBundle in ["com.apple.TextEdit", "com.apple.Notes", "com.apple.mail", "com.apple.iWork.Pages", "com.apple.MobileSMS"] {
+    func testVerifiedAXInsertSucceedsOnNativeAppsWithZeroKeystrokes() {
+        for nativeBundle in ["com.apple.TextEdit", "com.apple.Notes", "com.apple.mail", "com.apple.iWork.Pages", "com.apple.MobileSMS", "com.example.NativeEditor"] {
             let ax = MockAXDirectInserter()
             ax.result = .verified
             let poster = RecordingUnicodeKeystrokePoster()
             let injector = makeInjector(axInserter: ax, poster: poster)
 
-            let outcome = syncInsert(injector, text: "言落直接输入", targetBundleID: allowlistedBundle)
-            XCTAssertEqual(outcome, .inserted(method: .verifiedAccessibility), "Expected Tier 1 for \(allowlistedBundle)")
+            let outcome = syncInsert(injector, text: "言落直接输入", targetBundleID: nativeBundle)
+            XCTAssertEqual(outcome, .inserted(method: .verifiedAccessibility), "Expected Tier 1 for \(nativeBundle)")
             XCTAssertEqual(ax.callCount, 1)
             XCTAssertEqual(ax.lastText, "言落直接输入")
             XCTAssertEqual(ax.lastPID, 1234)
@@ -213,7 +213,8 @@ final class DirectTextInjectorTests: XCTestCase {
             XCTAssertTrue(poster.eventsSnapshot().isEmpty, "Tier 1 success must emit ZERO Unicode keystrokes")
         }
 
-        // Embedded WebView inside an allowlisted app (e.g. Mail/Notes with AXDOMIdentifier/AXURL) MUST skip Tier 1!
+        // Embedded WebView inside a native app (e.g., Mail) MUST skip AX write so React/WebKit editors
+        // never suffer silent DOM-only mutation without JS input events.
         let webSession = MockAXFocusedTextSession()
         webSession._isWebBackedElement = true
         let liveAX = LiveAXDirectInserter(isProcessTrusted: { true }, sessionProvider: { _ in webSession })
@@ -296,13 +297,11 @@ final class DirectTextInjectorTests: XCTestCase {
         XCTAssertEqual(poster.eventsSnapshot().count, 2)
     }
 
-    func testNonAllowlistedAppsIncludingSafariVulcanCodeAndUnknownSkipTier1DirectlyToUnicodeStream() {
-        let nonAllowlistedBundles = [
+    func testKnownUnreliableAppsSkipTier1DirectlyToUnicodeStream() {
+        let knownUnreliableBundles = [
             "com.apple.Safari",
             "ai.vulcan.code.desktop",
             "com.amazon.QuickWork.mac",
-            "com.openai.chat",
-            "com.unknown.ThirdPartyApp",
             "com.apple.Terminal",
             "com.mitchellh.ghostty",
             "com.microsoft.VSCode",
@@ -318,20 +317,34 @@ final class DirectTextInjectorTests: XCTestCase {
             "com.tencent.xinWeChat",
             "com.jetbrains.intellij",
             "com.jetbrains.goland",
-            nil,
         ]
 
-        for bundleID in nonAllowlistedBundles {
+        for bundleID in knownUnreliableBundles {
             let ax = MockAXDirectInserter()
             ax.result = .verified
             let poster = RecordingUnicodeKeystrokePoster()
             let injector = makeInjector(axInserter: ax, poster: poster)
 
             let outcome = syncInsert(injector, text: "OK", targetBundleID: bundleID)
-            XCTAssertEqual(outcome, .inserted(method: .unicodeKeystrokeStream), "Expected Tier 2 for \(bundleID ?? "nil")")
-            XCTAssertEqual(ax.callCount, 0, "Tier 1 MUST be skipped for \(bundleID ?? "nil")")
+            XCTAssertEqual(outcome, .inserted(method: .unicodeKeystrokeStream), "Expected Tier 2 for \(bundleID)")
+            XCTAssertEqual(ax.callCount, 0, "Tier 1 MUST be skipped for \(bundleID)")
             XCTAssertEqual(poster.eventsSnapshot().count, 2)
         }
+
+        // Unknown native apps must retain the working AX path. This is important when the user
+        // has Accessibility permission but has not granted synthetic keyboard-event permission.
+        let unknownAX = MockAXDirectInserter()
+        unknownAX.result = .verified
+        let unknownPoster = RecordingUnicodeKeystrokePoster()
+        let unknownInjector = makeInjector(axInserter: unknownAX, poster: unknownPoster)
+        let unknownOutcome = syncInsert(
+            unknownInjector,
+            text: "普通应用也能输入",
+            targetBundleID: "com.unknown.ThirdPartyApp"
+        )
+        XCTAssertEqual(unknownOutcome, .inserted(method: .verifiedAccessibility))
+        XCTAssertEqual(unknownAX.callCount, 1)
+        XCTAssertTrue(unknownPoster.eventsSnapshot().isEmpty)
     }
 
     func testUnicodeStreamHandlesChineseMixedTextPunctuationEmojiAndUsesInertNonAVirtualKey() {
@@ -625,5 +638,204 @@ final class DirectTextInjectorTests: XCTestCase {
         var upBuf = [UniChar](repeating: 0, count: 4)
         keyUp.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &upLen, unicodeString: &upBuf)
         XCTAssertEqual(upLen, 0, "keyUp MUST NOT have keyboardSetUnicodeString attached")
+    }
+
+    // MARK: - 3-Tier Pipeline (Verified AX -> Transient Clipboard Cmd+V -> Hardened Unicode Stream)
+
+    private final class StubClipboardFallback: ClipboardInjecting, @unchecked Sendable {
+        private let lock = NSLock()
+        var prepareResult: InjectionPreparationResult = .ready(
+            InjectionPreparation(transactionID: 1, expectedChangeCount: 42, hadSnapshot: true)
+        )
+        var currentChangeCountValue: Int = 42
+        var dispatchSucceeds: Bool = true
+        var onPrepare: (@Sendable () -> Void)?
+        private(set) var preparedTexts: [String] = []
+        private(set) var dispatchedCount: Int = 0
+        private(set) var restoreIfOwnedCount: Int = 0
+        private(set) var prePostGuardResult: Bool?
+
+        var readiness: ClipboardReadiness { .idle }
+        func whenIdle(_ callback: @escaping @Sendable () -> Void) { callback() }
+        func isTerminalApplication(bundleIdentifier: String?) -> Bool {
+            ClipboardInjector().isTerminalApplication(bundleIdentifier: bundleIdentifier)
+        }
+        func isTextSafeForTerminal(_ text: String) -> Bool {
+            ClipboardInjector().isTextSafeForTerminal(text)
+        }
+        func currentChangeCount() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return currentChangeCountValue
+        }
+        func preparePaste(
+            text: String,
+            targetBundleIdentifier: String?,
+            completion: @escaping @Sendable (InjectionPreparationResult) -> Void
+        ) {
+            lock.lock()
+            preparedTexts.append(text)
+            let hook = onPrepare
+            let result = prepareResult
+            lock.unlock()
+            hook?()
+            completion(result)
+        }
+        func dispatchSyntheticPaste(
+            preparation: InjectionPreparation,
+            restoreDelayMs: Int,
+            prePostGuard: (@Sendable () -> Bool)?,
+            completion: @escaping @Sendable (Bool) -> Void
+        ) {
+            let guardOK = prePostGuard?() ?? true
+            lock.lock()
+            prePostGuardResult = guardOK
+            if !guardOK {
+                restoreIfOwnedCount += 1
+                lock.unlock()
+                completion(false)
+                return
+            }
+            let ok = dispatchSucceeds
+            if ok {
+                dispatchedCount += 1
+            }
+            lock.unlock()
+            completion(ok)
+        }
+        func restoreIfOwned(preparation: InjectionPreparation) {
+            lock.lock()
+            restoreIfOwnedCount += 1
+            lock.unlock()
+        }
+        func copyTextForUser(_ text: String) {}
+    }
+
+    func testThreeTierPipelineUsesAXForNativeAppsTransientClipboardForElectronAndUnicodeForProtectedClipboard() {
+        // 1. Native AppKit app -> Tier 1 AX succeeds with ZERO clipboard touch and ZERO keystrokes
+        do {
+            let ax = MockAXDirectInserter()
+            ax.result = .verified
+            let clipboard = StubClipboardFallback()
+            let poster = RecordingUnicodeKeystrokePoster()
+            let injector = DirectTextInjector(
+                axInserter: ax,
+                keystrokePoster: poster,
+                clipboardFallback: clipboard,
+                isSecureInputEnabled: { false },
+                frontmostPIDProvider: { 1234 },
+                postEventAccessProbe: { true },
+                pacingDelayNs: 0
+            )
+            let outcome = syncInsert(injector, text: "原生输入框", targetBundleID: "com.apple.Notes")
+            XCTAssertEqual(outcome, .inserted(method: .verifiedAccessibility))
+            XCTAssertEqual(ax.callCount, 1)
+            XCTAssertTrue(clipboard.preparedTexts.isEmpty, "Native AX success MUST NOT touch clipboard")
+            XCTAssertTrue(poster.eventsSnapshot().isEmpty)
+        }
+
+        // 2. Electron / Browser / WeChat / Terminal -> Tier 2 transient clipboard Cmd+V (immune to WeType IME!)
+        for bundleID in ["com.google.Chrome", "com.apple.Safari", "dev.t3.code", "com.tencent.xinWeChat", "com.mitchellh.ghostty"] {
+            let ax = MockAXDirectInserter()
+            ax.result = .verified
+            let clipboard = StubClipboardFallback()
+            let poster = RecordingUnicodeKeystrokePoster()
+            let injector = DirectTextInjector(
+                axInserter: ax,
+                keystrokePoster: poster,
+                clipboardFallback: clipboard,
+                isSecureInputEnabled: { false },
+                frontmostPIDProvider: { 1234 },
+                postEventAccessProbe: { true },
+                pacingDelayNs: 0
+            )
+            let outcome = syncInsert(injector, text: "你好 Swift 2026", targetBundleID: bundleID)
+            XCTAssertEqual(outcome, .inserted(method: .transientClipboardPaste), "Expected Tier 2 Cmd+V for \(bundleID)")
+            XCTAssertEqual(ax.callCount, 0)
+            XCTAssertEqual(clipboard.preparedTexts, ["你好 Swift 2026"])
+            XCTAssertEqual(clipboard.dispatchedCount, 1)
+            XCTAssertEqual(clipboard.prePostGuardResult, true)
+            XCTAssertTrue(poster.eventsSnapshot().isEmpty)
+        }
+
+        // 3. Protected clipboard (e.g. concealed password / screenshot / Figma) -> zero overwrite, falls back to Tier 3 Unicode stream
+        for blockReason in [InjectionBlockReason.concealedContent, .filePromise, .largeImageOrUnsupported, .snapshotExceededBudget, .pasteboardAccessDenied] {
+            let ax = MockAXDirectInserter()
+            ax.result = .unverifiedOrSkipped
+            let clipboard = StubClipboardFallback()
+            clipboard.prepareResult = .blocked(blockReason)
+            let poster = RecordingUnicodeKeystrokePoster()
+            let injector = DirectTextInjector(
+                axInserter: ax,
+                keystrokePoster: poster,
+                clipboardFallback: clipboard,
+                isSecureInputEnabled: { false },
+                frontmostPIDProvider: { 1234 },
+                postEventAccessProbe: { true },
+                pacingDelayNs: 0
+            )
+            let outcome = syncInsert(injector, text: "保留剪贴板", targetBundleID: "com.google.Chrome")
+            XCTAssertEqual(outcome, .inserted(method: .unicodeKeystrokeStream), "Expected Tier 3 fallback when clipboard blocked by \(blockReason)")
+            XCTAssertEqual(clipboard.dispatchedCount, 0)
+            XCTAssertEqual(poster.eventsSnapshot().count, 5)
+        }
+    }
+
+    func testTier2ClipboardFocusDriftAbortsAndRestoresWithoutFallingBackToUnicode() {
+        let focusGen = AtomicUInt64(1)
+        let ax = MockAXDirectInserter()
+        ax.result = .unverifiedOrSkipped
+        let clipboard = StubClipboardFallback()
+        clipboard.onPrepare = {
+            focusGen.store(2, ordering: .release)
+        }
+        let poster = RecordingUnicodeKeystrokePoster()
+        let injector = DirectTextInjector(
+            axInserter: ax,
+            keystrokePoster: poster,
+            clipboardFallback: clipboard,
+            isSecureInputEnabled: { false },
+            frontmostPIDProvider: { 1234 },
+            postEventAccessProbe: { true },
+            pacingDelayNs: 0
+        )
+
+        let outcome = syncInsert(
+            injector,
+            text: "切窗口防误输",
+            targetBundleID: "com.google.Chrome",
+            expectedFocusGen: 1,
+            currentFocusGen: { focusGen.load(ordering: .acquire) }
+        )
+        XCTAssertEqual(
+            outcome,
+            .partiallyInserted(remainingText: "切窗口防误输", reason: DirectTextInjector.preWriteChangedAbortReason)
+        )
+        XCTAssertEqual(clipboard.restoreIfOwnedCount, 1)
+        XCTAssertEqual(clipboard.dispatchedCount, 0)
+        XCTAssertTrue(poster.eventsSnapshot().isEmpty, "Must NEVER fall back to Tier 3 after focus drift")
+    }
+
+    func testAXReadbackVerificationHandlesPlaceholderReplacementAndCRLFNormalization() {
+        // Placeholder replaced by inserted text with caret at end
+        XCTAssertTrue(
+            LiveAXDirectInserter.verifyPostWriteReadback(
+                insertedText: "搜索内容",
+                preRange: CFRange(location: 0, length: 0),
+                preValue: "Search…",
+                postRange: CFRange(location: 4, length: 0),
+                postValue: "搜索内容"
+            )
+        )
+        // CRLF normalized to LF by AppKit NSTextView
+        XCTAssertTrue(
+            LiveAXDirectInserter.verifyPostWriteReadback(
+                insertedText: "a\r\nb",
+                preRange: CFRange(location: 0, length: 0),
+                preValue: "",
+                postRange: CFRange(location: 3, length: 0),
+                postValue: "a\nb"
+            )
+        )
     }
 }

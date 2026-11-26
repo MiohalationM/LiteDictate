@@ -1363,4 +1363,27 @@ struct RequestCoordinatorTests {
             #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Legacy app fallback")
         }
     }
+
+    @Test("Perceptual dBFS audio level mapping stays calm in silence and responds strongly to normal speech")
+    func testPerceptualAudioLevelMappingRespondsStronglyToNormalSpeech() {
+        // Quiet room floor (~-58 dBFS RMS, -48 dBFS peak) stays calm near 0
+        let silence = RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: 0.0012, peakDBFS: -48.0)
+        #expect(silence <= 0.05)
+
+        // Typical MacBook Air normal speaking volume (-28 dBFS RMS ~= 0.04 linear, -16 dBFS peak)
+        let normalSpeech = RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: 0.04, peakDBFS: -16.0)
+        #expect(normalSpeech >= 0.65)
+        #expect(normalSpeech <= 0.90)
+
+        // Strong speaking (-20 dBFS RMS ~= 0.10 linear, -8 dBFS peak) reaches near-full excursion
+        let strongSpeech = RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: 0.10, peakDBFS: -8.0)
+        #expect(strongSpeech >= 0.85)
+        #expect(strongSpeech <= 1.0)
+        #expect(strongSpeech > normalSpeech)
+
+        // Non-finite / negative values clamp safely into [0, 1]
+        #expect(RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: .nan, peakDBFS: .nan) == 0.0)
+        #expect(RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: -0.5, peakDBFS: -120.0) == 0.0)
+        #expect(RequestCoordinator.normalizedDisplayAudioLevel(rmsLevel: .infinity, peakDBFS: .infinity) == 0.0)
+    }
 }

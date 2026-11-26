@@ -98,6 +98,8 @@ public final class LiveAXFocusedTextSession: AXFocusedTextSession, @unchecked Se
     }
 
     /// Detects WebKit/WebView-backed fields (even embedded inside Mail or Notes) via `AXDOMIdentifier` / `AXURL`.
+    /// Web-backed editors (React/Vue/ProseMirror/Lexical) can accept `kAXSelectedTextAttribute` on the DOM node
+    /// while skipping JS `beforeinput`/`input` state updates, so Tier 1 skips them in favor of Tier 2/3.
     public var isWebBackedElement: Bool {
         if role == "AXWebArea" {
             return true
@@ -241,6 +243,7 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
     public static let allowedNativeTextRoles: Set<String> = [
         "AXTextField",
         "AXTextArea",
+        "AXTextView",
         "AXComboBox",
         "AXSearchField",
     ]
@@ -284,7 +287,7 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
             return .unverifiedOrSkipped
         }
 
-        // Role & subrole safety check (block secure fields; skip WebViews / non-native text views).
+        // Role & subrole safety check (block secure fields; skip WebViews / non-native text roles).
         let role = session.role
         let subrole = session.subrole
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
@@ -371,7 +374,9 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
         postRange: CFRange?,
         postValue: String?
     ) -> Bool {
+        let normalizedInserted = insertedText.replacingOccurrences(of: "\r\n", with: "\n")
         let insertedUTF16 = insertedText.utf16.count
+        let normalizedUTF16 = normalizedInserted.utf16.count
         guard insertedUTF16 > 0 else { return true }
 
         // If we have both pre and post values, the string must have changed — EXCEPT when replacing
@@ -379,41 +384,61 @@ public final class LiveAXDirectInserter: AXDirectInserting, Sendable {
         if let preValue, let postValue {
             if postValue == preValue {
                 if let preRange, let postRange {
-                    return preRange.length == insertedUTF16
-                        && postRange.location == preRange.location + insertedUTF16
-                        && postRange.length == 0
+                    return (preRange.length == insertedUTF16 && postRange.location == preRange.location + insertedUTF16 && postRange.length == 0)
+                        || (preRange.length == normalizedUTF16 && postRange.location == preRange.location + normalizedUTF16 && postRange.length == 0)
                 }
                 return false
             }
+
+            // Placeholder-to-text transition: some empty AppKit fields return placeholder text for preValue,
+            // then switch cleanly to `insertedText` with caret at the end of the inserted string.
+            if (postValue == insertedText || postValue == normalizedInserted),
+               let postRange,
+               (postRange.location == insertedUTF16 || postRange.location == normalizedUTF16),
+               postRange.length == 0
+            {
+                return true
+            }
+
             if let preRange {
-                let expectedLen = preValue.utf16.count - preRange.length + insertedUTF16
-                let lengthMatches = (postValue.utf16.count == expectedLen)
+                let expectedLenRaw = preValue.utf16.count - preRange.length + insertedUTF16
+                let expectedLenNorm = preValue.utf16.count - preRange.length + normalizedUTF16
+                let postLen = postValue.utf16.count
+                let lengthMatches = (postLen == expectedLenRaw || postLen == expectedLenNorm)
                 if let postRange {
-                    let rangeAdvanced = (postRange.location == preRange.location + insertedUTF16 && postRange.length == 0)
+                    let rangeAdvanced = postRange.length == 0 && (
+                        postRange.location == preRange.location + insertedUTF16
+                            || postRange.location == preRange.location + normalizedUTF16
+                    )
                     return lengthMatches && rangeAdvanced
                 }
                 return lengthMatches
             }
             // No range available: require length grew by insertedUTF16 or content contains insertedText.
             return postValue.utf16.count == preValue.utf16.count + insertedUTF16
+                || postValue.utf16.count == preValue.utf16.count + normalizedUTF16
                 || postValue.contains(insertedText)
+                || postValue.contains(normalizedInserted)
         }
 
         // Large document (> 64 KB) where value snapshot was skipped: rely strictly on selectedTextRange advancement.
         if let preRange, let postRange {
-            return postRange.location == preRange.location + insertedUTF16 && postRange.length == 0
+            return postRange.length == 0 && (
+                postRange.location == preRange.location + insertedUTF16
+                    || postRange.location == preRange.location + normalizedUTF16
+            )
         }
 
         return false
     }
 }
 
-/// Production Tier 2 Unicode keystroke poster gated on `CGPreflightPostEventAccess()` (P0-1),
+/// Production Tier 3 Unicode keystroke poster gated on `CGPreflightPostEventAccess()` (P0-1),
 /// using `.privateState`, empty modifier flags, empirically verified inert virtual key (`0x00FF`,
 /// never `0x0000`/`kVK_ANSI_A`), `CGEventKeyboardSetUnicodeString` ONLY on `keyDown`,
-/// `0x4C444943` ("LDIC") userData on BOTH `keyDown` & `keyUp`, and a `0.25 ms` down-to-up gap.
+/// `0x4C444943` ("LDIC") userData on BOTH `keyDown` & `keyUp`, and a `1.5 ms` down-to-up gap.
 public final class LiveUnicodeKeystrokePoster: UnicodeKeystrokePosting, Sendable {
-    public static let defaultKeyDownToUpDelayNs: UInt64 = 250_000 // 0.25 ms
+    public static let defaultKeyDownToUpDelayNs: UInt64 = 1_500_000 // 1.5 ms
 
     private let postEventAccessProbe: @Sendable () -> Bool
     private let keyDownToUpDelayNs: UInt64
@@ -505,19 +530,60 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
     public static let focusChangedAbortReason = "输入过程中切换了窗口，剩余文字已为你保留"
     public static let postInterruptedAbortReason = "部分文字输入中断，剩余文字已为你保留"
 
-    public static let normalPacingDelayNs: UInt64 = 1_500_000  // 1.5 ms for <= 60 chunks
-    public static let longTextPacingDelayNs: UInt64 = 1_000_000 // 1.0 ms for > 60 chunks
+    public static let normalPacingDelayNs: UInt64 = 4_000_000   // 4.0 ms for <= 60 chunks
+    public static let longTextPacingDelayNs: UInt64 = 2_500_000 // 2.5 ms for > 60 chunks
     public static let longTextChunkThreshold: Int = 60
 
-    /// Strict verified pure-AppKit allowlist eligible for Tier 1 (`kAXSelectedTextAttribute`).
-    /// All browsers (Safari/Chrome/Arc/Firefox), Electron apps (VS Code/Cursor/Vulcan Code/T3 Code/Slack/Notion),
-    /// WeChat, Terminals, JetBrains, and unknown apps skip Tier 1 directly to Tier 2 Unicode keystroke stream.
-    public static let axAllowlistedBundleIDs: Set<String> = [
-        "com.apple.textedit",
-        "com.apple.notes",
-        "com.apple.mail",
-        "com.apple.iwork.pages",
-        "com.apple.mobilesms",
+    /// Apps whose Accessibility text value is known to report success while dropping the write
+    /// or bypassing web/framework editor state (React/ProseMirror/Lexical/Qt/Java/Terminals).
+    /// Native AppKit apps still get Tier 1 verified AX insertion with zero clipboard touch.
+    public static let axUnreliableBundleIDs: Set<String> = [
+        "com.apple.safari",
+        "com.apple.safari.technologypreview",
+        "ai.vulcan.code.desktop",
+        "com.amazon.quickwork.mac",
+        "com.microsoft.vscode",
+        "com.microsoft.vscodeinsiders",
+        "com.vscodium.vscodium",
+        "com.todesktop.230313mzl4w4u92",
+        "com.cursor.cursor",
+        "com.exafunction.windsurf",
+        "dev.zed.zed",
+        "com.zed.zed",
+        "com.sublimetext.4",
+        "com.sublimetext.3",
+        "dev.t3.code",
+        "com.t3.code",
+        "com.t3code.app",
+        "com.google.chrome",
+        "com.google.chrome.canary",
+        "com.google.chrome.beta",
+        "org.chromium.chromium",
+        "company.thebrowser.browser",
+        "company.thebrowser.dia",
+        "com.brave.browser",
+        "com.brave.browser.beta",
+        "com.microsoft.edgemac",
+        "com.microsoft.edgemac.beta",
+        "com.vivaldi.vivaldi",
+        "com.operasoftware.opera",
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxdeveloperedition",
+        "com.tinyspeck.slackmacgap",
+        "notion.id",
+        "com.hnc.discord",
+        "md.obsidian",
+        "com.linear",
+        "com.figma.desktop",
+        "com.tencent.xinwechat",
+        "com.tencent.weworkmac",
+        "com.tencent.qq",
+        "com.electron.lark",
+        "com.bytedance.feishu",
+        "com.alibaba.dingtalkmac",
+        "ru.keepcoder.telegram",
+        "com.whatsapp.desktop",
+        "com.microsoft.teams2",
     ]
 
     public struct KeystrokeChunk: Equatable, Sendable {
@@ -532,6 +598,8 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
 
     private let axInserter: AXDirectInserting
     private let keystrokePoster: UnicodeKeystrokePosting
+    private let clipboardFallback: ClipboardInjecting?
+    private let pasteRestoreDelayMs: Int
     private let isSecureInputEnabled: @Sendable () -> Bool
     private let frontmostPIDProvider: @Sendable () -> pid_t?
     private let postEventAccessProbe: @Sendable () -> Bool
@@ -551,6 +619,8 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
     public init(
         axInserter: AXDirectInserting = LiveAXDirectInserter(),
         keystrokePoster: UnicodeKeystrokePosting = LiveUnicodeKeystrokePoster(),
+        clipboardFallback: ClipboardInjecting? = nil,
+        pasteRestoreDelayMs: Int = LiteDictateConstants.defaultPasteRestoreDelayMs,
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() },
         frontmostPIDProvider: @escaping @Sendable () -> pid_t? = {
             NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -562,6 +632,8 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
     ) {
         self.axInserter = axInserter
         self.keystrokePoster = keystrokePoster
+        self.clipboardFallback = clipboardFallback
+        self.pasteRestoreDelayMs = pasteRestoreDelayMs
         self.isSecureInputEnabled = isSecureInputEnabled
         self.frontmostPIDProvider = frontmostPIDProvider
         self.postEventAccessProbe = postEventAccessProbe
@@ -594,13 +666,26 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
         return true
     }
 
-    /// Returns `true` when Tier 1 (`kAXSelectedTextAttribute`) must be skipped in favor of Tier 2.
-    /// Uses a strict pure-AppKit allowlist (`axAllowlistedBundleIDs`).
+    /// Returns `true` when Tier 1 (`kAXSelectedTextAttribute`) should be skipped in favor of Tier 2.
+    /// Unknown apps are intentionally allowed to try Tier 1. The live inserter verifies the focused
+    /// role, target PID, value/range readback, and focus state before reporting success.
     public func shouldSkipAccessibilityTier(bundleIdentifier: String?) -> Bool {
+        // A missing bundle identifier should not disable the reliable AX path. The focused
+        // element's role, PID, and readback checks remain the authority for whether it is safe.
         guard let bundleIdentifier, !bundleIdentifier.isEmpty else {
+            return false
+        }
+        let lower = bundleIdentifier.lowercased()
+        if terminalBundleIDs.contains(lower) || Self.axUnreliableBundleIDs.contains(lower) {
             return true
         }
-        return !Self.axAllowlistedBundleIDs.contains(bundleIdentifier.lowercased())
+        if lower.hasPrefix("com.jetbrains.") {
+            return true
+        }
+        if lower.contains("electron") || lower.contains("t3code") || lower.contains("t3.code") || lower.contains("t3-code") {
+            return true
+        }
+        return false
     }
 
     /// Splits `text` into safe 1–2 UTF-16 code-unit keystroke chunks preserving surrogate pairs (e.g. emoji)
@@ -779,69 +864,220 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
                 }
             }
 
-            // 5. P0-1: Gate Tier 2 Unicode keystroke stream on post-event TCC permission!
+            // 5. P0-1: Gate synthetic event posting (Tier 2 Cmd+V & Tier 3 Unicode stream) on post-event TCC permission!
             guard self.postEventAccessProbe() else {
                 self.deliver(.blocked(.eventPostFailed), to: completion)
                 return
             }
 
-            // 6. Tier 2: Direct Unicode keystroke stream with per-chunk focusGeneration & PID verification.
-            let chunks = Self.buildKeystrokeChunks(from: text)
-            let pacingNs: UInt64
-            if let fixedPacingDelayNs = self.fixedPacingDelayNs {
-                pacingNs = fixedPacingDelayNs
-            } else {
-                pacingNs = chunks.count > Self.longTextChunkThreshold
-                    ? Self.longTextPacingDelayNs
-                    : Self.normalPacingDelayNs
+            // 6. Tier 2: Transient clipboard Cmd+V (with zero-copy prescreen, 8 MiB snapshot, TransientType/AutoGeneratedType,
+            //    and auto-restore). Works universally across Electron, browsers, WeChat/Qt, JetBrains, and Terminals,
+            //    and is 100% immune to active Chinese IMEs (WeType / Pinyin). If the user's clipboard holds protected
+            //    content (passwords, file promises, large images/PNG/TIFF, custom binary) we NEVER overwrite it and
+            //    seamlessly fall through to Tier 3 Unicode keystroke streaming.
+            if let clipboardFallback = self.clipboardFallback {
+                self.attemptTransientClipboardOrUnicodeFallback(
+                    clipboard: clipboardFallback,
+                    text: text,
+                    targetPID: targetPID,
+                    targetBundleIdentifier: targetBundleIdentifier,
+                    expectedFocusGeneration: expectedFocusGeneration,
+                    currentFocusGeneration: currentFocusGeneration,
+                    completion: completion
+                )
+                return
             }
 
-            for (index, chunk) in chunks.enumerated() {
-                if currentFocusGeneration() != expectedFocusGeneration
-                    || (targetPID > 0 && self.frontmostPIDProvider() != targetPID)
-                {
+            // 7. Tier 3: Direct Unicode keystroke stream with per-chunk focusGeneration & PID verification.
+            self.runUnicodeKeystrokeStreamLocked(
+                text: text,
+                targetPID: targetPID,
+                expectedFocusGeneration: expectedFocusGeneration,
+                currentFocusGeneration: currentFocusGeneration,
+                completion: completion
+            )
+        }
+    }
+
+    private func attemptTransientClipboardOrUnicodeFallback(
+        clipboard: ClipboardInjecting,
+        text: String,
+        targetPID: pid_t,
+        targetBundleIdentifier: String?,
+        expectedFocusGeneration: UInt64,
+        currentFocusGeneration: @escaping @Sendable () -> UInt64,
+        completion: @escaping @Sendable (DirectInjectionOutcome) -> Void
+    ) {
+        clipboard.preparePaste(text: text, targetBundleIdentifier: targetBundleIdentifier) { [self] prepResult in
+            self.injectionQueue.async {
+                switch prepResult {
+                case let .blocked(blockReason):
+                    if blockReason == .terminalUnsafeCharacters {
+                        self.deliver(.blocked(.terminalUnsafeCharacters), to: completion)
+                        return
+                    }
+                    // Clipboard holds protected content (concealed secret, file promise, large image, Figma, >8 MiB,
+                    // or pasteboard denied): clipboard was NOT touched. Fall back cleanly to Tier 3 Unicode stream!
+                    self.runUnicodeKeystrokeStreamLocked(
+                        text: text,
+                        targetPID: targetPID,
+                        expectedFocusGeneration: expectedFocusGeneration,
+                        currentFocusGeneration: currentFocusGeneration,
+                        completion: completion
+                    )
+
+                case let .ready(preparation):
+                    if self.isSecureInputEnabled() {
+                        clipboard.restoreIfOwned(preparation: preparation)
+                        self.deliver(.blocked(.eventPostFailed), to: completion)
+                        return
+                    }
+                    if currentFocusGeneration() != expectedFocusGeneration
+                        || (targetPID > 0 && self.frontmostPIDProvider() != targetPID)
+                    {
+                        clipboard.restoreIfOwned(preparation: preparation)
+                        self.deliver(
+                            .partiallyInserted(remainingText: text, reason: Self.preWriteChangedAbortReason),
+                            to: completion
+                        )
+                        return
+                    }
+                    guard clipboard.currentChangeCount() == preparation.expectedChangeCount else {
+                        // User copied something new while preparing: abandon clipboard overwrite and fall back to Tier 3.
+                        self.runUnicodeKeystrokeStreamLocked(
+                            text: text,
+                            targetPID: targetPID,
+                            expectedFocusGeneration: expectedFocusGeneration,
+                            currentFocusGeneration: currentFocusGeneration,
+                            completion: completion
+                        )
+                        return
+                    }
+
+                    let prePostGuard: @Sendable () -> Bool = { [self] in
+                        !self.isSecureInputEnabled()
+                            && currentFocusGeneration() == expectedFocusGeneration
+                            && (targetPID <= 0 || self.frontmostPIDProvider() == targetPID)
+                    }
+
+                    clipboard.dispatchSyntheticPaste(
+                        preparation: preparation,
+                        restoreDelayMs: self.pasteRestoreDelayMs,
+                        prePostGuard: prePostGuard
+                    ) { [self] dispatched in
+                        self.injectionQueue.async {
+                            if dispatched {
+                                self.deliver(.inserted(method: .transientClipboardPaste), to: completion)
+                                return
+                            }
+                            if self.isSecureInputEnabled() || !self.postEventAccessProbe() {
+                                self.deliver(.blocked(.eventPostFailed), to: completion)
+                                return
+                            }
+                            if currentFocusGeneration() != expectedFocusGeneration
+                                || (targetPID > 0 && self.frontmostPIDProvider() != targetPID)
+                            {
+                                self.deliver(
+                                    .partiallyInserted(remainingText: text, reason: Self.preWriteChangedAbortReason),
+                                    to: completion
+                                )
+                                return
+                            }
+                            // Paste was skipped before posting (e.g. changeCount drifted): safely fall back to Tier 3.
+                            self.runUnicodeKeystrokeStreamLocked(
+                                text: text,
+                                targetPID: targetPID,
+                                expectedFocusGeneration: expectedFocusGeneration,
+                                currentFocusGeneration: currentFocusGeneration,
+                                completion: completion
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func runUnicodeKeystrokeStreamLocked(
+        text: String,
+        targetPID: pid_t,
+        expectedFocusGeneration: UInt64,
+        currentFocusGeneration: @escaping @Sendable () -> UInt64,
+        completion: @escaping @Sendable (DirectInjectionOutcome) -> Void
+    ) {
+        if self.isSecureInputEnabled() {
+            self.deliver(.blocked(.eventPostFailed), to: completion)
+            return
+        }
+        if currentFocusGeneration() != expectedFocusGeneration
+            || (targetPID > 0 && self.frontmostPIDProvider() != targetPID)
+        {
+            self.deliver(
+                .partiallyInserted(remainingText: text, reason: Self.preWriteChangedAbortReason),
+                to: completion
+            )
+            return
+        }
+        guard self.postEventAccessProbe() else {
+            self.deliver(.blocked(.eventPostFailed), to: completion)
+            return
+        }
+
+        let chunks = Self.buildKeystrokeChunks(from: text)
+        let pacingNs: UInt64
+        if let fixedPacingDelayNs = self.fixedPacingDelayNs {
+            pacingNs = fixedPacingDelayNs
+        } else {
+            pacingNs = chunks.count > Self.longTextChunkThreshold
+                ? Self.longTextPacingDelayNs
+                : Self.normalPacingDelayNs
+        }
+
+        for (index, chunk) in chunks.enumerated() {
+            if currentFocusGeneration() != expectedFocusGeneration
+                || (targetPID > 0 && self.frontmostPIDProvider() != targetPID)
+            {
+                let remaining = chunks[index...].map(\.sourceText).joined()
+                self.deliver(
+                    .partiallyInserted(remainingText: remaining, reason: Self.focusChangedAbortReason),
+                    to: completion
+                )
+                return
+            }
+
+            if self.isSecureInputEnabled() {
+                if index == 0 {
+                    self.deliver(.blocked(.eventPostFailed), to: completion)
+                } else {
                     let remaining = chunks[index...].map(\.sourceText).joined()
                     self.deliver(
                         .partiallyInserted(remainingText: remaining, reason: Self.focusChangedAbortReason),
                         to: completion
                     )
-                    return
                 }
-
-                if self.isSecureInputEnabled() {
-                    if index == 0 {
-                        self.deliver(.blocked(.eventPostFailed), to: completion)
-                    } else {
-                        let remaining = chunks[index...].map(\.sourceText).joined()
-                        self.deliver(
-                            .partiallyInserted(remainingText: remaining, reason: Self.focusChangedAbortReason),
-                            to: completion
-                        )
-                    }
-                    return
-                }
-
-                let posted = self.keystrokePoster.postKeystroke(chunk.event)
-                guard posted else {
-                    if index == 0 {
-                        self.deliver(.blocked(.eventPostFailed), to: completion)
-                    } else {
-                        let remaining = chunks[index...].map(\.sourceText).joined()
-                        self.deliver(
-                            .partiallyInserted(remainingText: remaining, reason: Self.postInterruptedAbortReason),
-                            to: completion
-                        )
-                    }
-                    return
-                }
-
-                if pacingNs > 0 && index + 1 < chunks.count {
-                    Self.sleepNanoseconds(pacingNs)
-                }
+                return
             }
 
-            self.deliver(.inserted(method: .unicodeKeystrokeStream), to: completion)
+            let posted = self.keystrokePoster.postKeystroke(chunk.event)
+            guard posted else {
+                if index == 0 {
+                    self.deliver(.blocked(.eventPostFailed), to: completion)
+                } else {
+                    let remaining = chunks[index...].map(\.sourceText).joined()
+                    self.deliver(
+                        .partiallyInserted(remainingText: remaining, reason: Self.postInterruptedAbortReason),
+                        to: completion
+                    )
+                }
+                return
+            }
+
+            if pacingNs > 0 && index + 1 < chunks.count {
+                Self.sleepNanoseconds(pacingNs)
+            }
         }
+
+        self.deliver(.inserted(method: .unicodeKeystrokeStream), to: completion)
     }
 
     private func deliver(

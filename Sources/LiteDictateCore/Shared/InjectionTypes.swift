@@ -39,6 +39,7 @@ public enum InjectionBlockReason: String, Equatable, Sendable {
 
 public enum DirectInsertMethod: String, Equatable, Sendable {
     case verifiedAccessibility
+    case transientClipboardPaste
     case unicodeKeystrokeStream
 }
 

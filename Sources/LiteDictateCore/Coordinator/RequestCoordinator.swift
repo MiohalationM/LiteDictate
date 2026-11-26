@@ -676,12 +676,12 @@ public final class RequestCoordinator: @unchecked Sendable {
             activeFirstFrameReceived = true
             publishStateLocked()
 
-        case let .levelUpdate(identity, rmsLevel, _):
+        case let .levelUpdate(identity, rmsLevel, peakDBFS):
             guard identity == activeCaptureIdentity else { return }
-            activeAudioLevel = max(0, min(1, rmsLevel))
+            activeAudioLevel = Self.normalizedDisplayAudioLevel(rmsLevel: rmsLevel, peakDBFS: peakDBFS)
             let now = nowProvider()
-            // Throttle UI overlay projection to ~15 Hz (66 ms)
-            if now.timeIntervalSince(lastOverlayLevelPublish) >= 0.066 {
+            // Throttle UI overlay projection to ~30 Hz (28 ms so 33 ms capture telemetry ticks are never dropped by jitter)
+            if now.timeIntervalSince(lastOverlayLevelPublish) >= 0.028 {
                 lastOverlayLevelPublish = now
                 publishStateLocked()
             }
@@ -696,6 +696,23 @@ public final class RequestCoordinator: @unchecked Sendable {
             lastErrorMessage = reason
             transitionToIdleLocked()
         }
+    }
+
+    /// Maps linear RMS + peak dBFS into a perceptually responsive `[0, 1]` meter level for the waveform pill.
+    /// Typical MacBook built-in mic conversational speech sits around `-32...-18 dBFS` RMS (`0.025...0.12` linear),
+    /// which would barely register on a linear scale; logarithmic dBFS scaling makes normal speech clearly expressive
+    /// while keeping quiet ambient noise calm near `0.0`.
+    public static func normalizedDisplayAudioLevel(rmsLevel: Float, peakDBFS: Float) -> Float {
+        let safeRMS: Float = rmsLevel.isFinite ? max(0.0, rmsLevel) : 0.0
+        let rmsDB: Float = safeRMS > 1e-6 ? 20.0 * log10f(safeRMS) : -120.0
+        let safePeakDB: Float = peakDBFS.isFinite ? peakDBFS : -120.0
+
+        // Silence floor at -54 dBFS RMS / -44 dBFS peak -> 0.0; strong speech at -14 dBFS RMS / -6 dBFS peak -> 1.0.
+        let rmsNorm = max(0.0, min(1.0, (rmsDB + 54.0) / 40.0))
+        let peakNorm = max(0.0, min(1.0, (safePeakDB + 44.0) / 38.0))
+        let blended = 0.65 * rmsNorm + 0.35 * peakNorm
+        guard blended > 0.001 else { return 0.0 }
+        return max(0.0, min(1.0, powf(blended, 0.85)))
     }
 
     private func handleCaptureCompletedLocked(_ result: AudioCaptureResult) {
