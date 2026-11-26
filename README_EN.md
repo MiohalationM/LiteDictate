@@ -46,8 +46,6 @@
   Hold **Right `⌘`** to speak and release to insert text. A `130 ms` chord guard keeps `Right ⌘ + C/V/Tab` completely untouched, and pressing `Esc` while holding cancels immediately. Record any custom single-modifier key (`Right ⌘`, `Right ⌥`, `Fn`, etc.) or combo (`⌘⇧D`, `⌥Space`) in Preferences.
 - **Non-Intrusive Auto-Copy Toast & 5-Item In-Memory History**
   When no text field is focused, you switch apps, or Secure Input is active, LiteDictate automatically copies the transcript and shows a 2.5-second bottom toast instead of blocking modal popups. Keeps up to 5 recent transcripts in RAM only (zero disk writes, zero logs, wiped on lock/sleep/quit).
-- **No Muffled Bluetooth Headphones**
-  Smart microphone selection prefers external or built-in mics so listening to music or joining calls on AirPods never drops into low-bitrate HFP call mode.
 - **100% Offline, Bring Your Own GGUF Model**
   Powered by `transcribe.cpp` with Metal GPU acceleration. Import any local `.gguf` speech model (Qwen3-ASR, Whisper, SenseVoice, Parakeet, etc.) by reference without duplicating files, plus custom vocabulary and alias rules.
 
