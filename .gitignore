@@ -1,0 +1,23 @@
+# Build outputs & SwiftPM
+.build/
+.swiftpm/
+Build/
+build/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Native libraries & GGUF models (fetched/imported locally, never committed)
+*.dylib
+*.gguf
+
+# Temporary & editor files
+*.swp
+*~
+.vscode/
+.idea/
