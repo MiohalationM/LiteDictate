@@ -8,10 +8,6 @@ import UniformTypeIdentifiers
 final class StatusBarController: NSObject, NSMenuDelegate {
     private enum MenuBarIconStyle: Hashable {
         case idleTemplate
-        case recording
-        case transcribing
-        case alert
-        case secureInputPaused
     }
 
     private let statusItem: NSStatusItem
@@ -57,55 +53,32 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         old.phase != new.phase ||
         old.workerState != new.workerState ||
         old.memoryPressure != new.memoryPressure ||
-        old.workerFootprintBytes != new.workerFootprintBytes ||
         old.isSecureInputPaused != new.isSecureInputPaused ||
         old.activeModelID != new.activeModelID ||
         old.models != new.models ||
         old.discoveredModels != new.discoveredModels ||
         old.isImportingModel != new.isImportingModel ||
         old.lastErrorMessage != new.lastErrorMessage ||
-        old.lastNoticeMessage != new.lastNoticeMessage ||
         old.audioSelection != new.audioSelection ||
         old.availableDevices != new.availableDevices ||
         old.resolvedDevice != new.resolvedDevice ||
         old.isBluetoothWarningActive != new.isBluetoothWarningActive ||
         old.hotkey != new.hotkey ||
-        old.preferredLanguage != new.preferredLanguage ||
-        old.inputMode != new.inputMode ||
-        old.launchAtLogin != new.launchAtLogin ||
-        old.hasLastCommittedText != new.hasLastCommittedText ||
+        old.recentHistory != new.recentHistory ||
         old.permissions != new.permissions
-    }
-
-    private func iconStyle(for snapshot: AppStateSnapshot) -> MenuBarIconStyle {
-        if snapshot.isSecureInputPaused {
-            return .secureInputPaused
-        }
-        switch snapshot.phase {
-        case .arming, .recording, .draining:
-            return .recording
-        case .waitingWorkerReady, .transcribing, .validating, .awaitingPreCommitReadiness, .preparingInjection, .revalidating, .commitStarted:
-            return .transcribing
-        case .recovery:
-            return .alert
-        case .idle:
-            if snapshot.memoryPressure == .critical || snapshot.activeModel?.isFileMissing == true || snapshot.lastErrorMessage != nil {
-                return .alert
-            }
-            return .idleTemplate
-        }
     }
 
     private func updateStatusIcon(_ snapshot: AppStateSnapshot) {
         guard let button = statusItem.button else { return }
-        let style = iconStyle(for: snapshot)
-        if currentIconStyle != style {
-            button.image = iconImage(for: style)
+        if currentIconStyle != .idleTemplate {
+            button.image = iconImage(for: .idleTemplate)
             button.imagePosition = .imageOnly
             button.title = ""
-            currentIconStyle = style
+            currentIconStyle = .idleTemplate
         }
-        button.appearsDisabled = (style == .secureInputPaused)
+        // Keep the menu bar icon steady monochrome during dictation (the floating pill shows active state).
+        // Only dim slightly when permissions are missing or macOS Secure Input pauses global hotkeys.
+        button.appearsDisabled = snapshot.isSecureInputPaused || !snapshot.permissions.allCorePermissionsGranted
     }
 
     private func iconImage(for style: MenuBarIconStyle) -> NSImage {
@@ -122,44 +95,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private static func makeMenuBarIcon(style: MenuBarIconStyle) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: true) { _ in
-            let primaryColor: NSColor
-            let outerAlpha: CGFloat
-            let innerAlpha: CGFloat
-            let dotColor: NSColor
-            let drawPausedSlash: Bool
-
-            switch style {
-            case .idleTemplate:
-                primaryColor = .black
-                outerAlpha = 0.72
-                innerAlpha = 1.0
-                dotColor = .black
-                drawPausedSlash = false
-            case .recording:
-                primaryColor = .systemRed
-                outerAlpha = 0.72
-                innerAlpha = 1.0
-                dotColor = .systemRed
-                drawPausedSlash = false
-            case .transcribing:
-                primaryColor = .systemBlue
-                outerAlpha = 0.72
-                innerAlpha = 1.0
-                dotColor = .systemBlue
-                drawPausedSlash = false
-            case .alert:
-                primaryColor = .systemOrange
-                outerAlpha = 0.72
-                innerAlpha = 1.0
-                dotColor = .systemOrange
-                drawPausedSlash = false
-            case .secureInputPaused:
-                primaryColor = .black
-                outerAlpha = 0.36
-                innerAlpha = 0.55
-                dotColor = NSColor.black.withAlphaComponent(0.55)
-                drawPausedSlash = true
-            }
+            let primaryColor = NSColor.black
+            let outerAlpha: CGFloat = 0.72
+            let innerAlpha: CGFloat = 1.0
 
             // Exact geometry from Resources/MenuBarIcon.svg (viewBox="0 0 18 18")
             let bars: [(rect: NSRect, alpha: CGFloat)] = [
@@ -183,22 +121,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 width: dotRadius * 2.0,
                 height: dotRadius * 2.0
             )
-            dotColor.setFill()
+            primaryColor.setFill()
             NSBezierPath(ovalIn: dotRect).fill()
-
-            if drawPausedSlash {
-                let slash = NSBezierPath()
-                slash.move(to: NSPoint(x: 2.4, y: 15.2))
-                slash.line(to: NSPoint(x: 15.6, y: 2.4))
-                slash.lineWidth = 1.45
-                slash.lineCapStyle = .round
-                NSColor.black.withAlphaComponent(0.88).setStroke()
-                slash.stroke()
-            }
 
             return true
         }
-        image.isTemplate = (style == .idleTemplate || style == .secureInputPaused)
+        image.isTemplate = true
         image.accessibilityDescription = "言落"
         return image
     }
@@ -206,121 +134,95 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func rebuildMenu(_ snapshot: AppStateSnapshot) {
         menu.removeAllItems()
 
-        // 1. Friendly Status Header
-        let statusLine: String
-        if snapshot.memoryPressure == .critical {
-            statusLine = "言落 · 系统内存紧张，已暂时暂停识别"
-        } else if snapshot.workerState == .stopped {
-            statusLine = "言落 · 待命中（未占用模型内存）"
-        } else if snapshot.workerState == .warmModel {
-            statusLine = "言落 · 已就绪（模型待机中）"
-        } else {
-            statusLine = "言落 · \(snapshot.workerState.displayTitle)"
+        // Conditional top alerts — hidden completely during normal operation to keep the menu crisp & compact.
+        var hasTopAlert = false
+        if !snapshot.permissions.allCorePermissionsGranted {
+            let permAlert = NSMenuItem(title: "⚡ 开启系统权限…", action: nil, keyEquivalent: "")
+            let permMenu = NSMenu()
+            populatePermissionsSubmenu(permMenu, permissions: snapshot.permissions)
+            permAlert.submenu = permMenu
+            menu.addItem(permAlert)
+            hasTopAlert = true
         }
-        let headerItem = NSMenuItem(title: statusLine, action: nil, keyEquivalent: "")
-        headerItem.isEnabled = false
-        menu.addItem(headerItem)
-
+        if snapshot.memoryPressure == .critical {
+            let memItem = NSMenuItem(title: "⚠ 系统内存紧张，已暂停识别", action: nil, keyEquivalent: "")
+            memItem.isEnabled = false
+            menu.addItem(memItem)
+            hasTopAlert = true
+        }
         if snapshot.isSecureInputPaused {
-            let secItem = NSMenuItem(title: "当前在密码输入框中，已暂停语音输入", action: nil, keyEquivalent: "")
+            let secItem = NSMenuItem(title: "密码输入框中 · 已暂停", action: nil, keyEquivalent: "")
             secItem.isEnabled = false
             menu.addItem(secItem)
+            hasTopAlert = true
         }
         if let err = snapshot.lastErrorMessage, !err.isEmpty {
             let errItem = NSMenuItem(title: "⚠ \(err)", action: nil, keyEquivalent: "")
             errItem.isEnabled = false
             menu.addItem(errItem)
-        } else if let notice = snapshot.lastNoticeMessage, !notice.isEmpty {
-            let noticeItem = NSMenuItem(title: notice, action: nil, keyEquivalent: "")
-            noticeItem.isEnabled = false
-            menu.addItem(noticeItem)
+            hasTopAlert = true
         }
-
-        menu.addItem(.separator())
-
-        // Prominent 1-click guided permission setup whenever any core permission is missing.
-        if !snapshot.permissions.allCorePermissionsGranted {
-            let pullAllTop = NSMenuItem(
-                title: "⚡ 开启系统权限以开始使用…",
-                action: #selector(onRequestAllMissingPermissions),
-                keyEquivalent: ""
-            )
-            pullAllTop.target = self
-            menu.addItem(pullAllTop)
+        if hasTopAlert {
             menu.addItem(.separator())
         }
 
-        // 2. Quick Dictation Toggle
-        let toggleTitle: String
-        if snapshot.phase == .recording || snapshot.phase == .arming {
-            toggleTitle = "停止说话并识别 (\(snapshot.hotkey.displayString))"
-        } else {
-            toggleTitle = "开始语音输入 (\(snapshot.hotkey.displayString))"
-        }
+        // 1. Primary action: Start / Stop Dictation
+        let isActiveRecording = (snapshot.phase == .recording || snapshot.phase == .arming)
+        let toggleTitle = isActiveRecording
+            ? "停止说话 (\(snapshot.hotkey.displayString))"
+            : "开始说话 (\(snapshot.hotkey.displayString))"
         let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(onToggleRecording), keyEquivalent: "")
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        if snapshot.hasLastCommittedText {
-            let copyLastItem = NSMenuItem(
-                title: "复制上一次识别文字",
-                action: #selector(onCopyLastCommittedText),
+        // 2. Recent 5 in-memory transcripts (click to copy; 0 disk, wiped on sleep/lock/quit)
+        if !snapshot.recentHistory.isEmpty {
+            let historyRoot = NSMenuItem(
+                title: "最近识别 (\(snapshot.recentHistory.count))",
+                action: nil,
                 keyEquivalent: ""
             )
-            copyLastItem.target = self
-            menu.addItem(copyLastItem)
+            let historyMenu = NSMenu()
+            populateHistorySubmenu(historyMenu, entries: snapshot.recentHistory)
+            historyRoot.submenu = historyMenu
+            menu.addItem(historyRoot)
         }
-
-        // 3. Speaking Mode Submenu
-        let modeRoot = NSMenuItem(
-            title: "说话方式：\(snapshot.hotkey.triggerMode.shortTitle)",
-            action: nil,
-            keyEquivalent: ""
-        )
-        let modeMenu = NSMenu()
-        let toggleModeItem = NSMenuItem(
-            title: HotkeyTriggerMode.toggle.displayTitle,
-            action: #selector(onSelectToggleMode),
-            keyEquivalent: ""
-        )
-        toggleModeItem.target = self
-        toggleModeItem.state = (snapshot.hotkey.triggerMode == .toggle) ? .on : .off
-        modeMenu.addItem(toggleModeItem)
-
-        let pttModeItem = NSMenuItem(
-            title: HotkeyTriggerMode.pushToTalk.displayTitle,
-            action: #selector(onSelectPTTMode),
-            keyEquivalent: ""
-        )
-        pttModeItem.target = self
-        pttModeItem.state = (snapshot.hotkey.triggerMode == .pushToTalk) ? .on : .off
-        modeMenu.addItem(pttModeItem)
-        modeRoot.submenu = modeMenu
-        menu.addItem(modeRoot)
 
         menu.addItem(.separator())
 
-        // 4. Models Submenu
-        let activeModelLabel = snapshot.activeModel.map {
-            $0.isFileMissing ? "\($0.displayName)（文件缺失）" : $0.displayName
-        } ?? "尚未选择"
-        let modelRoot = NSMenuItem(title: "语音模型：\(activeModelLabel)", action: nil, keyEquivalent: "")
+        // 3. Hotkey & Trigger Mode quick switcher
+        let modeShort = snapshot.hotkey.triggerMode == .pushToTalk ? "按住" : "开关"
+        let hotkeyRoot = NSMenuItem(
+            title: "快捷键 · \(modeShort) \(snapshot.hotkey.displayString)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        let hotkeyMenu = NSMenu()
+        populateHotkeySubmenu(hotkeyMenu, current: snapshot.hotkey)
+        hotkeyRoot.submenu = hotkeyMenu
+        menu.addItem(hotkeyRoot)
+
+        // 4. Model Submenu (concise label)
+        let activeModelLabel: String
+        if let model = snapshot.activeModel {
+            let base = truncatedMenuLabel(model.displayName, maxLength: 24)
+            activeModelLabel = model.isFileMissing ? "\(base)（缺失）" : base
+        } else {
+            activeModelLabel = "未选择"
+        }
+        let modelRoot = NSMenuItem(title: "模型 · \(activeModelLabel)", action: nil, keyEquivalent: "")
         let modelMenu = NSMenu()
         populateModelSubmenu(modelMenu, snapshot: snapshot)
         modelRoot.submenu = modelMenu
         menu.addItem(modelRoot)
 
-        // 5. Microphone Submenu
-        let micLabel: String
-        switch snapshot.audioSelection {
-        case .smartAuto:
-            let resolved = snapshot.resolvedDevice?.name ?? "无可用麦克风"
-            micLabel = "智能选择 (\(resolved))"
-        case .pinned:
-            let resolved = snapshot.resolvedDevice?.name ?? "已指定（当前离线）"
-            micLabel = resolved
-        }
-        let micRoot = NSMenuItem(title: "麦克风：\(micLabel)", action: nil, keyEquivalent: "")
+        // 5. Microphone Submenu (concise resolved name)
+        let rawMicName = snapshot.resolvedDevice?.name ?? "未连接"
+        let micRoot = NSMenuItem(
+            title: "麦克风 · \(truncatedMenuLabel(rawMicName, maxLength: 22))",
+            action: nil,
+            keyEquivalent: ""
+        )
         let micMenu = NSMenu()
         populateMicSubmenu(micMenu, snapshot: snapshot)
         micRoot.submenu = micMenu
@@ -328,52 +230,84 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        // 6. Launch at Login Toggle
-        let loginItem: NSMenuItem
-        switch snapshot.launchAtLogin {
-        case .enabled:
-            loginItem = NSMenuItem(title: "开机自动启动", action: #selector(onToggleLaunchAtLogin), keyEquivalent: "")
-            loginItem.state = .on
-            loginItem.target = self
-        case .notRegistered:
-            loginItem = NSMenuItem(title: "开机自动启动", action: #selector(onToggleLaunchAtLogin), keyEquivalent: "")
-            loginItem.state = .off
-            loginItem.target = self
-        case .requiresApproval:
-            loginItem = NSMenuItem(title: "开机自动启动（需在系统设置批准）…", action: #selector(onOpenLoginItemsSettings), keyEquivalent: "")
-            loginItem.state = .mixed
-            loginItem.target = self
-        case .unavailable:
-            loginItem = NSMenuItem(title: "开机自动启动（需从应用程序启动）", action: nil, keyEquivalent: "")
-            loginItem.isEnabled = false
-        }
-        menu.addItem(loginItem)
-
-        // 7. Preferences Window
+        // 6. Preferences & Quit
         let prefsItem = NSMenuItem(title: "偏好设置…", action: #selector(onOpenPreferences), keyEquivalent: ",")
         prefsItem.target = self
         menu.addItem(prefsItem)
 
-        if snapshot.workerState == .warmModel {
-            let unloadItem = NSMenuItem(title: "立即释放模型内存", action: #selector(onShutdownWorker), keyEquivalent: "")
-            unloadItem.target = self
-            menu.addItem(unloadItem)
-        }
-
-        // 8. System Permissions Submenu
-        let permStatus = snapshot.permissions.allCorePermissionsGranted ? "已全部开启" : "待开启"
-        let permRoot = NSMenuItem(title: "系统权限：\(permStatus)", action: nil, keyEquivalent: "")
-        let permMenu = NSMenu()
-        populatePermissionsSubmenu(permMenu, permissions: snapshot.permissions)
-        permRoot.submenu = permMenu
-        menu.addItem(permRoot)
-
-        menu.addItem(.separator())
-
-        // 9. Quit
         let quitItem = NSMenuItem(title: "退出言落", action: #selector(onQuit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    private func truncatedMenuLabel(_ text: String, maxLength: Int) -> String {
+        guard text.count > maxLength else { return text }
+        return String(text.prefix(maxLength - 1)) + "…"
+    }
+
+    private func populateHistorySubmenu(_ submenu: NSMenu, entries: [RecentTranscriptEntry]) {
+        for entry in entries {
+            let item = NSMenuItem(
+                title: entry.menuPreview(maxCharacters: 22),
+                action: #selector(onCopyHistoryItem(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = entry.id
+            submenu.addItem(item)
+        }
+        submenu.addItem(.separator())
+        let clearItem = NSMenuItem(
+            title: "清空记录",
+            action: #selector(onClearRecentHistory),
+            keyEquivalent: ""
+        )
+        clearItem.target = self
+        submenu.addItem(clearItem)
+    }
+
+    private func populateHotkeySubmenu(_ submenu: NSMenu, current: HotkeyBinding) {
+        let pttItem = NSMenuItem(
+            title: HotkeyTriggerMode.pushToTalk.displayTitle,
+            action: #selector(onSelectPTTMode),
+            keyEquivalent: ""
+        )
+        pttItem.target = self
+        pttItem.state = (current.triggerMode == .pushToTalk) ? .on : .off
+        submenu.addItem(pttItem)
+
+        let toggleItem = NSMenuItem(
+            title: HotkeyTriggerMode.toggle.displayTitle,
+            action: #selector(onSelectToggleMode),
+            keyEquivalent: ""
+        )
+        toggleItem.target = self
+        toggleItem.state = (current.triggerMode == .toggle) ? .on : .off
+        submenu.addItem(toggleItem)
+
+        submenu.addItem(.separator())
+
+        let presets: [(title: String, binding: HotkeyBinding, selector: Selector)] = [
+            ("右 ⌘（按住说话 · 默认）", .rightCommandPTT, #selector(onPresetRightCommandPTT)),
+            ("右 ⌥（按住说话）", .rightOptionPTT, #selector(onPresetRightOptionPTT)),
+            ("Fn（按住说话）", .fnPTT, #selector(onPresetFnPTT)),
+            ("⌘⇧D（按一下开关）", .cmdShiftD, #selector(onPresetCmdShiftD)),
+        ]
+        for preset in presets {
+            let item = NSMenuItem(title: preset.title, action: preset.selector, keyEquivalent: "")
+            item.target = self
+            let isSelected = (current.kind == preset.binding.kind &&
+                              current.keyCode == preset.binding.keyCode &&
+                              current.modifiers == preset.binding.modifiers &&
+                              current.triggerMode == preset.binding.triggerMode)
+            item.state = isSelected ? .on : .off
+            submenu.addItem(item)
+        }
+
+        submenu.addItem(.separator())
+        let customItem = NSMenuItem(title: "自定义快捷键…", action: #selector(onOpenPreferences), keyEquivalent: "")
+        customItem.target = self
+        submenu.addItem(customItem)
     }
 
     private func populateModelSubmenu(_ submenu: NSMenu, snapshot: AppStateSnapshot) {
@@ -435,6 +369,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let rescan = NSMenuItem(title: "重新扫描本机目录", action: #selector(onRescanModels), keyEquivalent: "")
         rescan.target = self
         submenu.addItem(rescan)
+
+        if snapshot.workerState == .warmModel {
+            submenu.addItem(.separator())
+            let unloadItem = NSMenuItem(title: "立即释放模型内存", action: #selector(onShutdownWorker), keyEquivalent: "")
+            unloadItem.target = self
+            submenu.addItem(unloadItem)
+        }
     }
 
     private func populateMicSubmenu(_ submenu: NSMenu, snapshot: AppStateSnapshot) {
@@ -544,12 +485,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func onToggleRecording() { dispatchAction(.toggleRecording) }
-    @objc private func onCopyLastCommittedText() { dispatchAction(.copyLastCommittedText) }
+    @objc private func onCopyHistoryItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        dispatchAction(.copyHistoryItem(id: id))
+    }
+    @objc private func onClearRecentHistory() { dispatchAction(.clearRecentHistory) }
     @objc private func onShutdownWorker() { dispatchAction(.shutdownWorkerNow) }
     @objc private func onRescanModels() { dispatchAction(.rescanDiscoveredModels) }
     @objc private func onSelectSmartAutoMic() { dispatchAction(.setAudioSelection(.smartAuto)) }
     @objc private func onSelectToggleMode() { dispatchAction(.setTriggerMode(.toggle)) }
     @objc private func onSelectPTTMode() { dispatchAction(.setTriggerMode(.pushToTalk)) }
+    @objc private func onPresetRightCommandPTT() { dispatchAction(.setHotkeyBinding(.rightCommandPTT)) }
+    @objc private func onPresetRightOptionPTT() { dispatchAction(.setHotkeyBinding(.rightOptionPTT)) }
+    @objc private func onPresetFnPTT() { dispatchAction(.setHotkeyBinding(.fnPTT)) }
+    @objc private func onPresetCmdShiftD() { dispatchAction(.setHotkeyBinding(.cmdShiftD)) }
     @objc private func onRequestAllMissingPermissions() { dispatchAction(.requestAllMissingPermissions) }
     @objc private func onRequestMicPermission() { dispatchAction(.requestMicrophonePermission) }
     @objc private func onRequestInputMonitoring() { dispatchAction(.requestInputMonitoringPermission) }

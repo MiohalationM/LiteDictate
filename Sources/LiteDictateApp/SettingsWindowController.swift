@@ -4,7 +4,8 @@ import LiteDictateCore
 import UniformTypeIdentifiers
 
 /// Interactive visual shortcut recorder pill (Pure AppKit).
-/// Click to record a new modifier + key shortcut; press Esc to cancel recording.
+/// Supports BOTH single-modifier keys (Right ⌘, Left ⌘, Right ⌥, Left ⌥, Fn, Right ⇧, Right ⌃)
+/// AND traditional modifier+key combos (e.g. ⌘⇧D, ⌥Space). Press Esc to cancel recording.
 @MainActor
 private final class HotkeyRecorderButton: NSButton {
     var onRecorded: ((HotkeyBinding) -> Void)?
@@ -12,6 +13,8 @@ private final class HotkeyRecorderButton: NSButton {
     private var currentBinding: HotkeyBinding = .defaultBinding
     private var isRecordingShortcut: Bool = false
     private var localMonitor: Any?
+    private var pendingSingleModifierKeyCode: UInt16?
+    private var chordOccurredDuringRecording: Bool = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -43,6 +46,8 @@ private final class HotkeyRecorderButton: NSButton {
     func cancelRecording() {
         guard isRecordingShortcut else { return }
         isRecordingShortcut = false
+        pendingSingleModifierKeyCode = nil
+        chordOccurredDuringRecording = false
         if let monitor = localMonitor {
             NSEvent.removeMonitor(monitor)
             localMonitor = nil
@@ -53,11 +58,36 @@ private final class HotkeyRecorderButton: NSButton {
 
     private func updateTitle() {
         if isRecordingShortcut {
-            title = "请按下新快捷键（Esc 取消）"
+            if let pending = pendingSingleModifierKeyCode {
+                title = "松开即可设为 \(HotkeyBinding.singleModifierLabel(for: pending))…"
+            } else {
+                title = "按下单键（如右⌘/Fn）或组合键（Esc 取消）"
+            }
             contentTintColor = .controlAccentColor
         } else {
             title = "  \(currentBinding.displayString)  （点击修改）"
             contentTintColor = nil
+        }
+    }
+
+    private static func isModifierPressed(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
+        HotkeyDebtMachine.isSingleModifierDown(keyCode: keyCode, rawFlags: UInt64(flags.rawValue))
+    }
+
+    private static func expectedModifierFlag(for keyCode: UInt16) -> NSEvent.ModifierFlags {
+        switch keyCode {
+        case UInt16(kVK_RightCommand), UInt16(kVK_Command):
+            return .command
+        case UInt16(kVK_RightOption), UInt16(kVK_Option):
+            return .option
+        case UInt16(kVK_RightShift), UInt16(kVK_Shift):
+            return .shift
+        case UInt16(kVK_RightControl), UInt16(kVK_Control):
+            return .control
+        case UInt16(kVK_Function):
+            return .function
+        default:
+            return []
         }
     }
 
@@ -67,11 +97,61 @@ private final class HotkeyRecorderButton: NSButton {
             return
         }
         isRecordingShortcut = true
+        pendingSingleModifierKeyCode = nil
+        chordOccurredDuringRecording = false
         onRecordingStateChanged?(true)
         updateTitle()
 
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self, self.isRecordingShortcut else { return event }
+
+            if event.type == .flagsChanged {
+                let keyCode = event.keyCode
+                guard HotkeyBinding.isSingleModifierKeyCode(keyCode) else { return nil }
+                let rawFlags = UInt64(event.modifierFlags.rawValue)
+                let isDown = Self.isModifierPressed(keyCode: keyCode, flags: event.modifierFlags)
+                let activeModifiers = event.modifierFlags.intersection([.command, .option, .shift, .control, .function])
+                let expectedFlag = Self.expectedModifierFlag(for: keyCode)
+
+                if isDown {
+                    if !self.chordOccurredDuringRecording
+                        && self.pendingSingleModifierKeyCode == nil
+                        && activeModifiers == expectedFlag
+                        && !HotkeyDebtMachine.hasExtraModifiersBesidesSingleTarget(keyCode: keyCode, rawFlags: rawFlags)
+                    {
+                        self.pendingSingleModifierKeyCode = keyCode
+                        self.updateTitle()
+                    } else if self.pendingSingleModifierKeyCode != keyCode {
+                        // Multiple modifiers held together: user is building a combo, not a single modifier.
+                        self.pendingSingleModifierKeyCode = nil
+                        self.chordOccurredDuringRecording = true
+                        self.updateTitle()
+                    }
+                } else {
+                    if let pending = self.pendingSingleModifierKeyCode,
+                       pending == keyCode,
+                       !self.chordOccurredDuringRecording {
+                        let mask = HotkeyBinding.singleModifierMask(for: keyCode)
+                        let updated = HotkeyBinding(
+                            kind: .singleModifier,
+                            keyCode: keyCode,
+                            modifiers: mask,
+                            triggerMode: self.currentBinding.triggerMode,
+                            strictLeftSideOnly: false
+                        )
+                        self.currentBinding = updated
+                        self.cancelRecording()
+                        self.onRecorded?(updated)
+                    } else if activeModifiers.isEmpty {
+                        self.pendingSingleModifierKeyCode = nil
+                        self.chordOccurredDuringRecording = false
+                        self.updateTitle()
+                    }
+                }
+                return nil
+            }
+
+            // `.keyDown`
             if event.keyCode == UInt16(kVK_Escape) {
                 self.cancelRecording()
                 return nil
@@ -86,11 +166,16 @@ private final class HotkeyRecorderButton: NSButton {
 
             // Require at least one modifier key so normal typing keys cannot be hijacked.
             guard !mask.isEmpty else {
+                self.pendingSingleModifierKeyCode = nil
                 NSSound.beep()
                 return nil
             }
 
+            self.pendingSingleModifierKeyCode = nil
+            self.chordOccurredDuringRecording = true
+
             let updated = HotkeyBinding(
+                kind: .keyCombo,
                 keyCode: event.keyCode,
                 modifiers: mask,
                 triggerMode: self.currentBinding.triggerMode,
@@ -102,6 +187,11 @@ private final class HotkeyRecorderButton: NSButton {
             return nil
         }
     }
+}
+
+@MainActor
+private final class FlippedClipView: NSClipView {
+    override var isFlipped: Bool { true }
 }
 
 /// 100% lazy, zero-retention Pure AppKit Preferences Window (`偏好设置…`).
@@ -180,6 +270,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             old.inputMode != newSnapshot.inputMode ||
             old.preferredLanguage != newSnapshot.preferredLanguage ||
             old.playFeedbackSounds != newSnapshot.playFeedbackSounds ||
+            old.modelIdleUnloadPolicy != newSnapshot.modelIdleUnloadPolicy ||
             old.activeModelID != newSnapshot.activeModelID ||
             old.models != newSnapshot.models ||
             old.discoveredModels != newSnapshot.discoveredModels ||
@@ -195,6 +286,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     func textDidChange(_ notification: Notification) {
         hasUnsavedDictEdits = true
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        hotkeyRecorder?.cancelRecording()
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -358,7 +453,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         stack.addArrangedSubview(triggerRow)
 
-        // 3. Visual Shortcut Recorder + Reset
+        // 3. Visual Shortcut Recorder + 1-click Presets + Reset
         let shortcutRow = makeLabeledRow("呼出快捷键") {
             let recorder = HotkeyRecorderButton(frame: .zero)
             recorder.setBinding(snapshot.hotkey)
@@ -370,13 +465,47 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             }
             self.hotkeyRecorder = recorder
 
-            let resetBtn = NSButton(title: "恢复默认 ⌘⇧D", target: self, action: #selector(onResetDefaultHotkey))
+            let resetBtn = NSButton(title: "恢复默认 右 ⌘", target: self, action: #selector(onResetDefaultHotkey))
             resetBtn.bezelStyle = .rounded
 
-            let h = NSStackView(views: [recorder, resetBtn])
-            h.orientation = .horizontal
-            h.spacing = 8
-            return h
+            let topLine = NSStackView(views: [recorder, resetBtn])
+            topLine.orientation = .horizontal
+            topLine.spacing = 8
+
+            let presetSpecs: [(title: String, binding: HotkeyBinding, action: Selector)] = [
+                ("右 ⌘", .rightCommandPTT, #selector(onPresetRightCommand)),
+                ("右 ⌥", .rightOptionPTT, #selector(onPresetRightOption)),
+                ("Fn", .fnPTT, #selector(onPresetFn)),
+                ("⌘⇧D", .cmdShiftD, #selector(onPresetCmdShiftD)),
+            ]
+            let presetLabel = NSTextField(labelWithString: "常用预设：")
+            presetLabel.font = NSFont.systemFont(ofSize: 11.5)
+            presetLabel.textColor = .secondaryLabelColor
+
+            var presetViews: [NSView] = [presetLabel]
+            for spec in presetSpecs {
+                let btn = NSButton(title: spec.title, target: self, action: spec.action)
+                btn.bezelStyle = .rounded
+                btn.controlSize = .small
+                let isSelected = (snapshot.hotkey.kind == spec.binding.kind &&
+                                  snapshot.hotkey.keyCode == spec.binding.keyCode &&
+                                  snapshot.hotkey.modifiers == spec.binding.modifiers)
+                if isSelected {
+                    btn.bezelColor = .controlAccentColor
+                    btn.contentTintColor = .white
+                }
+                presetViews.append(btn)
+            }
+            let presetLine = NSStackView(views: presetViews)
+            presetLine.orientation = .horizontal
+            presetLine.alignment = .centerY
+            presetLine.spacing = 6
+
+            let v = NSStackView(views: [topLine, presetLine])
+            v.orientation = .vertical
+            v.alignment = .leading
+            v.spacing = 6
+            return v
         }
         stack.addArrangedSubview(shortcutRow)
 
@@ -422,7 +551,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         // 6. Feedback Sound Toggle
         let soundRow = makeLabeledRow("轻提示音") {
             let cb = NSButton(
-                checkboxWithTitle: "单次录满自动结束时播放轻提示音",
+                checkboxWithTitle: "开始与结束语音输入时播放轻提示音",
                 target: self,
                 action: #selector(onToggleFeedbackSounds(_:))
             )
@@ -504,15 +633,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.contentView = FlippedClipView()
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
+        scroll.drawsBackground = true
+        scroll.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35)
         scroll.documentView = listStack
         NSLayoutConstraint.activate([
-            scroll.heightAnchor.constraint(equalToConstant: 214),
-            listStack.widthAnchor.constraint(equalTo: scroll.widthAnchor, constant: -16),
+            scroll.heightAnchor.constraint(equalToConstant: 184),
+            listStack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor, constant: -16),
+            listStack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor, constant: 8),
+            listStack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor, constant: 8),
         ])
         root.addArrangedSubview(scroll)
         scroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // Model idle auto-unload policy selector
+        let unloadLabel = NSTextField(labelWithString: "空闲自动释放模型：")
+        unloadLabel.font = NSFont.systemFont(ofSize: 12.5)
+        let unloadPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        let policies = ModelIdleUnloadPolicy.allCases
+        unloadPopup.addItems(withTitles: policies.map(\.displayTitle))
+        if let idx = policies.firstIndex(of: snapshot.modelIdleUnloadPolicy) {
+            unloadPopup.selectItem(at: idx)
+        }
+        unloadPopup.target = self
+        unloadPopup.action = #selector(onModelIdleUnloadPolicyChanged(_:))
+
+        let unloadRow = NSStackView(views: [unloadLabel, unloadPopup])
+        unloadRow.orientation = .horizontal
+        unloadRow.alignment = .centerY
+        unloadRow.spacing = 6
+        root.addArrangedSubview(unloadRow)
 
         // Concise guide on obtaining open-source models (P2-2: everyday consumer Chinese)
         let guide = NSTextField(
@@ -573,12 +725,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         removeBtn.identifier = NSUserInterfaceItemIdentifier(model.id)
         buttons.addArrangedSubview(removeBtn)
 
-        let row = NSStackView(views: [infoStack, buttons])
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let row = NSStackView(views: [infoStack, spacer, buttons])
         row.translatesAutoresizingMaskIntoConstraints = false
         row.orientation = .horizontal
         row.alignment = .centerY
         row.distribution = .fill
-        infoStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        infoStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        buttons.setContentHuggingPriority(.required, for: .horizontal)
 
         card.addSubview(row)
         NSLayoutConstraint.activate([
@@ -837,9 +993,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     @objc private func onResetDefaultHotkey() {
-        var reset = HotkeyBinding.defaultBinding
-        reset.triggerMode = snapshot.hotkey.triggerMode
-        dispatchAction(.setHotkeyBinding(reset))
+        hotkeyRecorder?.cancelRecording()
+        dispatchAction(.setHotkeyBinding(.defaultBinding))
+    }
+
+    @objc private func onPresetRightCommand() {
+        hotkeyRecorder?.cancelRecording()
+        dispatchAction(.setHotkeyBinding(.rightCommandPTT))
+    }
+
+    @objc private func onPresetRightOption() {
+        hotkeyRecorder?.cancelRecording()
+        dispatchAction(.setHotkeyBinding(.rightOptionPTT))
+    }
+
+    @objc private func onPresetFn() {
+        hotkeyRecorder?.cancelRecording()
+        dispatchAction(.setHotkeyBinding(.fnPTT))
+    }
+
+    @objc private func onPresetCmdShiftD() {
+        hotkeyRecorder?.cancelRecording()
+        dispatchAction(.setHotkeyBinding(.cmdShiftD))
     }
 
     @objc private func onSelectDirectTypingMode() {
@@ -862,6 +1037,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     @objc private func onToggleFeedbackSounds(_ sender: NSButton) {
         dispatchAction(.setPlayFeedbackSounds(sender.state == .on))
+    }
+
+    @objc private func onModelIdleUnloadPolicyChanged(_ sender: NSPopUpButton) {
+        let policies = ModelIdleUnloadPolicy.allCases
+        let idx = sender.indexOfSelectedItem
+        guard idx >= 0, idx < policies.count else { return }
+        dispatchAction(.setModelIdleUnloadPolicy(policies[idx]))
     }
 
     @objc private func onImportModel() {

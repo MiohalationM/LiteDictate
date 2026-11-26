@@ -43,31 +43,87 @@ public enum HotkeyTriggerMode: String, Codable, Hashable, Sendable {
     }
 }
 
+public enum HotkeyKind: String, Codable, Hashable, Sendable {
+    /// Traditional modifier(s) + non-modifier key combo (e.g. ⌘⇧D, ⌥Space).
+    case keyCombo
+    /// Dedicated single modifier / Fn key (e.g. Right ⌘, Right ⌥, Fn).
+    case singleModifier
+}
+
 public struct HotkeyBinding: Codable, Hashable, Sendable {
-    /// macOS virtual key code (default: 0x02 = kVK_ANSI_D).
+    /// Whether this shortcut is a modifier+key combo or a standalone single modifier / Fn key.
+    public var kind: HotkeyKind
+    /// macOS virtual key code (default: 0x36 = kVK_RightCommand).
     public var keyCode: UInt16
-    /// Exact required modifier flags (extra Ctrl/Opt rejected; CapsLock ignored).
+    /// Exact required modifier flags (for `.keyCombo`, extra Ctrl/Opt rejected; CapsLock ignored).
     public var modifiers: HotkeyModifierMask
     public var triggerMode: HotkeyTriggerMode
     public var strictLeftSideOnly: Bool
 
-    public static let defaultBinding = HotkeyBinding(
-        keyCode: 0x02,
+    /// Default binding: Hold Right ⌘ Command to speak, release to insert.
+    public static let rightCommandPTT = HotkeyBinding(
+        kind: .singleModifier,
+        keyCode: 0x36, // kVK_RightCommand
+        modifiers: [.command],
+        triggerMode: .pushToTalk,
+        strictLeftSideOnly: false
+    )
+
+    public static let rightOptionPTT = HotkeyBinding(
+        kind: .singleModifier,
+        keyCode: 0x3D, // kVK_RightOption
+        modifiers: [.option],
+        triggerMode: .pushToTalk,
+        strictLeftSideOnly: false
+    )
+
+    public static let fnPTT = HotkeyBinding(
+        kind: .singleModifier,
+        keyCode: 0x3F, // kVK_Function
+        modifiers: [],
+        triggerMode: .pushToTalk,
+        strictLeftSideOnly: false
+    )
+
+    public static let cmdShiftD = HotkeyBinding(
+        kind: .keyCombo,
+        keyCode: 0x02, // kVK_ANSI_D
         modifiers: [.command, .shift],
         triggerMode: .toggle,
         strictLeftSideOnly: false
     )
 
+    public static let defaultBinding = rightCommandPTT
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case keyCode
+        case modifiers
+        case triggerMode
+        case strictLeftSideOnly
+    }
+
     public init(
+        kind: HotkeyKind = .keyCombo,
         keyCode: UInt16 = 0x02,
         modifiers: HotkeyModifierMask = [.command, .shift],
         triggerMode: HotkeyTriggerMode = .toggle,
         strictLeftSideOnly: Bool = false
     ) {
+        self.kind = kind
         self.keyCode = keyCode
         self.modifiers = modifiers
         self.triggerMode = triggerMode
         self.strictLeftSideOnly = strictLeftSideOnly
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decodeIfPresent(HotkeyKind.self, forKey: .kind) ?? .keyCombo
+        keyCode = try c.decodeIfPresent(UInt16.self, forKey: .keyCode) ?? 0x02
+        modifiers = try c.decodeIfPresent(HotkeyModifierMask.self, forKey: .modifiers) ?? [.command, .shift]
+        triggerMode = try c.decodeIfPresent(HotkeyTriggerMode.self, forKey: .triggerMode) ?? .toggle
+        strictLeftSideOnly = try c.decodeIfPresent(Bool.self, forKey: .strictLeftSideOnly) ?? false
     }
 
     public var keyLabel: String {
@@ -75,7 +131,44 @@ public struct HotkeyBinding: Codable, Hashable, Sendable {
     }
 
     public var displayString: String {
-        "\(modifiers.displaySymbols)\(keyLabel)"
+        if kind == .singleModifier {
+            return Self.singleModifierLabel(for: keyCode)
+        }
+        return "\(modifiers.displaySymbols)\(keyLabel)"
+    }
+
+    public static func singleModifierMask(for keyCode: UInt16) -> HotkeyModifierMask {
+        switch keyCode {
+        case 0x36, 0x37: return [.command]
+        case 0x3A, 0x3D: return [.option]
+        case 0x38, 0x3C: return [.shift]
+        case 0x3B, 0x3E: return [.control]
+        default: return []
+        }
+    }
+
+    public static func isSingleModifierKeyCode(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
+        case 0x36, 0x37, 0x38, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public static func singleModifierLabel(for keyCode: UInt16) -> String {
+        switch keyCode {
+        case 0x36: return "右 ⌘"
+        case 0x37: return "左 ⌘"
+        case 0x3D: return "右 ⌥"
+        case 0x3A: return "左 ⌥"
+        case 0x3C: return "右 ⇧"
+        case 0x38: return "左 ⇧"
+        case 0x3E: return "右 ⌃"
+        case 0x3B: return "左 ⌃"
+        case 0x3F: return "Fn"
+        default: return labelForKeyCode(keyCode)
+        }
     }
 
     public static func labelForKeyCode(_ code: UInt16) -> String {
@@ -107,6 +200,15 @@ public struct HotkeyBinding: Codable, Hashable, Sendable {
         case 0x2D: return "N"
         case 0x2E: return "M"
         case 0x31: return "Space"
+        case 0x36: return "右 ⌘"
+        case 0x37: return "左 ⌘"
+        case 0x3D: return "右 ⌥"
+        case 0x3A: return "左 ⌥"
+        case 0x3C: return "右 ⇧"
+        case 0x38: return "左 ⇧"
+        case 0x3E: return "右 ⌃"
+        case 0x3B: return "左 ⌃"
+        case 0x3F: return "Fn"
         default: return String(format: "Key(0x%02X)", code)
         }
     }
@@ -118,6 +220,7 @@ public enum HotkeyEvent: Equatable, Sendable {
     case triggerToggle(gestureGeneration: GestureGeneration)
     case cancelEscape
     case systemReset(reason: String)
+    case secureInputEnded
 }
 
 public protocol HotkeyControlling: AnyObject, Sendable {
@@ -142,4 +245,12 @@ public protocol HotkeyControlling: AnyObject, Sendable {
     /// checking Command/Shift/Option/Control ONLY (explicitly excluding CapsLock).
     func areHIDModifiersClear() -> Bool
     func currentHIDModifierMask() -> HotkeyModifierMask
+
+    /// Reconciles stale `swallowedTriggerKeyDown` / `triggerKeyDebtActive` against live HID key state
+    /// (`CGEventSource.keyState(.hidSystemState, key:)`) in case a trigger `keyUp` was dropped by the OS or another app.
+    func reconcileStaleTriggerKeyDebtWithLiveHID()
+}
+
+public extension HotkeyControlling {
+    func reconcileStaleTriggerKeyDebtWithLiveHID() {}
 }

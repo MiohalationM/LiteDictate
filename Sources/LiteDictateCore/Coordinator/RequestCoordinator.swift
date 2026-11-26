@@ -1,4 +1,7 @@
 import Foundation
+import os
+
+private let coordinatorLogger = Logger(subsystem: "io.github.litedictate", category: "Coordinator")
 
 public struct CoordinatorTimings: Sendable {
     public var toggleCooldownMs: Int
@@ -39,6 +42,7 @@ public struct CoordinatorSnapshotDelta: Equatable, Sendable {
     public let overlay: RecordingOverlayState
     public let recovery: RecoveryPayload?
     public let hasLastCommittedText: Bool
+    public let recentHistory: [RecentTranscriptEntry]
     public let isCoolingDown: Bool
     public let lastErrorMessage: String?
     public let lastNoticeMessage: String?
@@ -64,6 +68,8 @@ public final class RequestCoordinator: @unchecked Sendable {
     private let timings: CoordinatorTimings
     private let nowProvider: @Sendable () -> Date
     private let selfPIDProvider: @Sendable () -> pid_t
+    private let onCaptureReadySound: (@Sendable () -> Void)?
+    private let onCommitSuccessSound: (@Sendable () -> Void)?
     private let onLimitTruncatedSound: (@Sendable () -> Void)?
     private let onOpenMicrophoneSettingsNeeded: (@Sendable () -> Void)?
 
@@ -117,9 +123,12 @@ public final class RequestCoordinator: @unchecked Sendable {
     private var pcmRetentionTimer: DispatchWorkItem?
     private var recoveryTextRetentionTimer: DispatchWorkItem?
 
-    // P0-1 UX safety: single in-memory copy of the last committed text (5-min TTL, cleared on sleep/lock/quit, 0 disk, 0 logs).
-    private var lastCommittedText: String?
-    private var lastCommittedTextTimer: DispatchWorkItem?
+    // P0-1 UX safety: up to 5 recent in-memory transcripts (10-min TTL, cleared on sleep/lock/quit, 0 disk, 0 logs).
+    public static let maxRecentHistoryCount: Int = 5
+    private var recentHistory: [RecentTranscriptEntry] = []
+    private var recentHistoryTimer: DispatchWorkItem?
+    private var activeOverlayToastMessage: String?
+    private var overlayToastTimer: DispatchWorkItem?
 
     private var lastErrorMessage: String?
     private var lastNoticeMessage: String?
@@ -138,6 +147,8 @@ public final class RequestCoordinator: @unchecked Sendable {
         timings: CoordinatorTimings = .production,
         nowProvider: @escaping @Sendable () -> Date = { Date() },
         selfPIDProvider: @escaping @Sendable () -> pid_t = { ProcessInfo.processInfo.processIdentifier },
+        onCaptureReadySound: (@Sendable () -> Void)? = nil,
+        onCommitSuccessSound: (@Sendable () -> Void)? = nil,
         onLimitTruncatedSound: (@Sendable () -> Void)? = nil,
         onOpenMicrophoneSettingsNeeded: (@Sendable () -> Void)? = nil
     ) {
@@ -157,6 +168,8 @@ public final class RequestCoordinator: @unchecked Sendable {
         self.timings = timings
         self.nowProvider = nowProvider
         self.selfPIDProvider = selfPIDProvider
+        self.onCaptureReadySound = onCaptureReadySound
+        self.onCommitSuccessSound = onCommitSuccessSound
         self.onLimitTruncatedSound = onLimitTruncatedSound
         self.onOpenMicrophoneSettingsNeeded = onOpenMicrophoneSettingsNeeded
 
@@ -219,7 +232,18 @@ public final class RequestCoordinator: @unchecked Sendable {
                 self.handleCancelEscapeLocked()
             case let .systemReset(reason):
                 self.handleSystemResetLocked(reason: reason)
+            case .secureInputEnded:
+                self.isSecureInputPaused = self.permissionManager.isSecureEventInputEnabled()
+                self.publishStateLocked()
             }
+        }
+    }
+
+    public func syncSecureInputState(_ isSecure: Bool) {
+        coordinatorQueue.async {
+            guard self.isSecureInputPaused != isSecure else { return }
+            self.isSecureInputPaused = isSecure
+            self.publishStateLocked()
         }
     }
 
@@ -243,17 +267,42 @@ public final class RequestCoordinator: @unchecked Sendable {
 
     public func copyLastCommittedText() {
         coordinatorQueue.async {
-            guard let text = self.lastCommittedText, !text.isEmpty else {
+            guard let text = self.recentHistory.first?.text, !text.isEmpty else {
                 return
             }
             self.clipboardInjector.copyTextForUser(text)
-            self.lastNoticeMessage = "已复制上一次识别的文字"
+            self.lastNoticeMessage = "已复制上一次识别文字"
+            if self.phase == .idle {
+                self.showOverlayToastLocked("已复制到剪贴板")
+            }
+            self.publishStateLocked()
+        }
+    }
+
+    public func copyHistoryItem(id: UUID) {
+        coordinatorQueue.async {
+            guard let entry = self.recentHistory.first(where: { $0.id == id }), !entry.text.isEmpty else {
+                return
+            }
+            self.clipboardInjector.copyTextForUser(entry.text)
+            self.lastNoticeMessage = "已复制到剪贴板"
+            if self.phase == .idle {
+                self.showOverlayToastLocked("已复制到剪贴板")
+            }
+            self.publishStateLocked()
+        }
+    }
+
+    public func clearRecentHistory() {
+        coordinatorQueue.async {
+            self.clearLastCommittedTextLocked()
             self.publishStateLocked()
         }
     }
 
     public func handleSystemSleepOrLock(reason: String) {
         coordinatorQueue.async {
+            self.clearOverlayToastLocked()
             self.cancelActiveRequestLocked(notice: nil)
             self.wipeAllPrivacyDataLocked()
             self.clearLastCommittedTextLocked()
@@ -264,6 +313,7 @@ public final class RequestCoordinator: @unchecked Sendable {
 
     public func prepareForQuit() {
         coordinatorQueue.async {
+            self.clearOverlayToastLocked()
             self.cancelActiveRequestLocked(notice: nil)
             self.wipeAllPrivacyDataLocked()
             self.clearLastCommittedTextLocked()
@@ -611,6 +661,7 @@ public final class RequestCoordinator: @unchecked Sendable {
         armToggleCooldownOnIdle = false
         lastErrorMessage = nil
         lastNoticeMessage = nil
+        clearOverlayToastLocked()
 
         setPhaseLocked(.arming)
 
@@ -664,7 +715,11 @@ public final class RequestCoordinator: @unchecked Sendable {
 
         case let .firstFrameReceived(identity):
             guard identity == activeCaptureIdentity else { return }
+            let wasReady = activeFirstFrameReceived
             activeFirstFrameReceived = true
+            if !wasReady && config.playFeedbackSounds {
+                onCaptureReadySound?()
+            }
             if phase == .arming {
                 setPhaseLocked(.recording)
             } else {
@@ -811,14 +866,17 @@ public final class RequestCoordinator: @unchecked Sendable {
             activeFocusContext = ctx
 
         case .focusInvalidated:
-            // If we are in AwaitingPreCommitReadiness (before insertion/clipboard write!), bail immediately to RecoveryPanel.
-            if phase == .awaitingPreCommitReadiness, let text = preCommitText {
-                cancelPreCommitTimersLocked()
+            // Only bail out during pre-commit wait if the user actually switched to a DIFFERENT app.
+            // Same-app window/popover/tab focus churn should never falsely block auto-insertion.
+            if phase == .awaitingPreCommitReadiness,
+               let text = preCommitText,
+               let focus = activeFocusContext,
+               !focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate)
+            {
                 focusMonitor.stopMonitoring(requestID: activeRequestID)
-                enterRecoveryWithTextLocked(
+                deliverFallbackCopyWithToastLocked(
                     text: text,
-                    reason: "刚刚切换了窗口，文字已为你安全保留",
-                    keepRetainedPCM: false
+                    toastMessage: "已切换应用 · 已复制到剪贴板"
                 )
             }
         }
@@ -871,13 +929,14 @@ public final class RequestCoordinator: @unchecked Sendable {
             // Trim horizontal spaces only so newline/CR characters are preserved for strict terminal safety validation.
             let processedText = aliasedText.trimmingCharacters(in: .whitespaces)
 
-            // Audio interruption or dropped frames MUST route to RecoveryPanel (Section 5.2).
-            if activeAudioInterrupted || activeDroppedFrames > 0 || activeFocusContext == nil {
+            // Retried audio (no original focus context) routes to auto-copy + toast so user can paste cleanly.
+            // Minor audio dropped frames with valid recognized text proceed straight to normal insertion!
+            if activeFocusContext == nil {
                 focusMonitor.stopMonitoring(requestID: identity.requestID)
-                let reason = activeAudioInterrupted || activeDroppedFrames > 0
-                    ? "刚刚收音略有中断，请确认识别结果"
-                    : "重新识别完成，可以插入或复制文字"
-                enterRecoveryWithTextLocked(text: processedText, reason: reason, keepRetainedPCM: false)
+                deliverFallbackCopyWithToastLocked(
+                    text: processedText,
+                    toastMessage: "识别完成 · 已复制到剪贴板"
+                )
                 return
             }
 
@@ -955,36 +1014,41 @@ public final class RequestCoordinator: @unchecked Sendable {
         setPhaseLocked(.validating)
 
         guard let focus = activeFocusContext else {
-            enterRecoveryWithTextLocked(text: text, reason: "未找到原来的输入窗口，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "已复制到剪贴板")
             return
         }
 
-        // Pre-check focus, secure input, and terminal safety BEFORE touching insertion/clipboard!
-        if focusMonitor.currentFocusGeneration != focus.focusGeneration ||
-            !focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate) {
+        // Pre-check focus app match, non-editable surface, secure input, and terminal safety BEFORE inserting!
+        if focus.pid <= 0 || focus.pid == selfPIDProvider() {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: "刚刚切换了窗口，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "未在输入框 · 已复制到剪贴板")
+            return
+        }
+        if !focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate) {
+            focusMonitor.stopMonitoring(requestID: requestID)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "已切换应用 · 已复制到剪贴板")
             return
         }
         if config.inputMode == .clipboardCompatibility && !focus.axInitialized {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: "当前窗口暂不支持自动输入，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "当前窗口不支持自动粘贴 · 已复制到剪贴板")
             return
         }
         if permissionManager.isSecureEventInputEnabled() ||
             focus.isSecureTextField ||
             focusMonitor.isCurrentFocusedElementSecureTextField() {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: "当前是密码输入框，为保护隐私已暂停自动输入", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "密码框已暂停 · 已复制到剪贴板")
+            return
+        }
+        if focusMonitor.isCurrentFocusedElementKnownNonEditable(bundleIdentifier: focus.bundleIdentifier) {
+            focusMonitor.stopMonitoring(requestID: requestID)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "未在输入框 · 已复制到剪贴板")
             return
         }
         if isTerminalUnsafeLocked(text: text, bundleIdentifier: focus.bundleIdentifier) {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(
-                text: text,
-                reason: InjectionBlockReason.terminalUnsafeCharacters.userMessage,
-                keepRetainedPCM: false
-            )
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "终端含换行 · 已复制到剪贴板")
             return
         }
 
@@ -1033,7 +1097,11 @@ public final class RequestCoordinator: @unchecked Sendable {
     }
 
     private func areHIDAndKeyDebtClearLocked() -> Bool {
-        hotkeyController.areHIDModifiersClear() && !triggerKeyDebtActive.load(ordering: .acquire)
+        if triggerKeyDebtActive.load(ordering: .acquire) {
+            // Self-heal stale key debt if macOS/another app dropped trigger keyUp while physical key is already released.
+            hotkeyController.reconcileStaleTriggerKeyDebtWithLiveHID()
+        }
+        return hotkeyController.areHIDModifiersClear() && !triggerKeyDebtActive.load(ordering: .acquire)
     }
 
     private func armPreCommitHIDWaitLocked(requestID: RequestID) {
@@ -1045,12 +1113,14 @@ public final class RequestCoordinator: @unchecked Sendable {
                   self.preCommitRequestID == requestID,
                   let text = self.preCommitText
             else { return }
+            let mods = self.hotkeyController.currentHIDModifierMask().rawValue
+            let debt = self.triggerKeyDebtActive.load(ordering: .acquire)
+            coordinatorLogger.notice("Pre-commit HID wait timed out (mods=\(mods, privacy: .public), keyDebt=\(debt, privacy: .public))")
             self.cancelPreCommitTimersLocked()
             self.focusMonitor.stopMonitoring(requestID: requestID)
-            self.enterRecoveryWithTextLocked(
+            self.deliverFallbackCopyWithToastLocked(
                 text: text,
-                reason: "按键尚未松开，文字已为你保留在这里",
-                keepRetainedPCM: false
+                toastMessage: "按键尚未松开 · 已复制到剪贴板"
             )
         }
         preCommitTimeoutTimer = timeout
@@ -1089,12 +1159,12 @@ public final class RequestCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Direct natural text insertion commit arbiter (DEFAULT mode — ZERO clipboard touch!).
+    /// Direct natural text insertion commit arbiter (DEFAULT mode — ZERO clipboard touch for native AX!).
     private func proceedToDirectInsertionLocked(requestID: RequestID, text: String) {
         cancelPreCommitTimersLocked()
         preCommitText = nil
         guard let focus = activeFocusContext else {
-            enterRecoveryWithTextLocked(text: text, reason: "未找到原来的输入窗口，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "已复制到剪贴板")
             return
         }
 
@@ -1103,7 +1173,7 @@ public final class RequestCoordinator: @unchecked Sendable {
         // Synchronous commit arbiter verifying ALL direct-typing safety invariants before typing a single character.
         if let failReason = evaluateCoreCommitInvariantsLocked(requestID: requestID, text: text, focus: focus) {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: failReason, keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: failReason)
             return
         }
 
@@ -1111,11 +1181,13 @@ public final class RequestCoordinator: @unchecked Sendable {
         setPhaseLocked(.commitStarted)
 
         let monitor = focusMonitor
+        // Snapshot the current generation right before commit so only a mid-stream focus change aborts streaming.
+        let commitFocusGen = monitor.currentFocusGeneration
         directInjector.insertTextDirectly(
             text,
             targetPID: focus.pid,
             targetBundleIdentifier: focus.bundleIdentifier,
-            expectedFocusGeneration: focus.focusGeneration,
+            expectedFocusGeneration: commitFocusGen,
             currentFocusGeneration: { monitor.currentFocusGeneration }
         ) { [weak self] outcome in
             guard let self else { return }
@@ -1124,7 +1196,7 @@ public final class RequestCoordinator: @unchecked Sendable {
                 guard self.activeRequestID == requestID && self.phase == .commitStarted else {
                     return
                 }
-                // Free PCM immediately now that transcription result has been delivered or handed to RecoveryPanel.
+                // Free PCM immediately now that transcription result has been delivered or saved.
                 self.retainedPCM = nil
                 self.retainedModelForRetry = nil
                 self.pcmRetentionTimer?.cancel()
@@ -1133,12 +1205,27 @@ public final class RequestCoordinator: @unchecked Sendable {
                 switch outcome {
                 case .inserted:
                     self.recordLastCommittedTextLocked(text)
+                    if self.config.playFeedbackSounds {
+                        self.onCommitSuccessSound?()
+                    }
                     self.transitionToIdleLocked()
-                case let .partiallyInserted(remainingText, reason):
+                case let .partiallyInserted(remainingText, _):
                     let kept = remainingText.isEmpty ? text : remainingText
-                    self.enterRecoveryWithTextLocked(text: kept, reason: reason, keepRetainedPCM: false)
+                    self.deliverFallbackCopyWithToastLocked(
+                        text: kept,
+                        toastMessage: "已切换应用 · 剩余文字已复制到剪贴板"
+                    )
                 case let .blocked(blockReason):
-                    self.enterRecoveryWithTextLocked(text: text, reason: blockReason.userMessage, keepRetainedPCM: false)
+                    let toast: String
+                    switch blockReason {
+                    case .terminalUnsafeCharacters:
+                        toast = "终端含换行 · 已复制到剪贴板"
+                    case .eventPostFailed:
+                        toast = "需开启「自动输入文字」权限 · 已复制到剪贴板"
+                    default:
+                        toast = "未自动输入 · 已复制到剪贴板"
+                    }
+                    self.deliverFallbackCopyWithToastLocked(text: text, toastMessage: toast)
                 }
             }
         }
@@ -1148,15 +1235,14 @@ public final class RequestCoordinator: @unchecked Sendable {
         cancelPreCommitTimersLocked()
         preCommitText = nil
         guard let focus = activeFocusContext else {
-            enterRecoveryWithTextLocked(text: text, reason: "未找到原来的输入窗口，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "已复制到剪贴板")
             return
         }
 
         // Re-check focus right before touching clipboard.
-        if focusMonitor.currentFocusGeneration != focus.focusGeneration ||
-            !focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate) {
+        if !focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate) {
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: "刚刚切换了窗口，文字已为你安全保留", keepRetainedPCM: false)
+            deliverFallbackCopyWithToastLocked(text: text, toastMessage: "已切换应用 · 已复制到剪贴板")
             return
         }
 
@@ -1192,7 +1278,16 @@ public final class RequestCoordinator: @unchecked Sendable {
         switch result {
         case let .blocked(reason):
             focusMonitor.stopMonitoring(requestID: requestID)
-            enterRecoveryWithTextLocked(text: text, reason: reason.userMessage, keepRetainedPCM: false)
+            switch reason {
+            case .concealedContent, .filePromise, .snapshotExceededBudget, .largeImageOrUnsupported, .pasteboardAccessDenied:
+                // Never overwrite protected/denied clipboard content — retain in 5-item in-memory history instead!
+                let toast = (reason == .pasteboardAccessDenied)
+                    ? "未开启剪贴板权限 · 已暂存至最近识别"
+                    : "剪贴板受保护 · 已暂存至最近识别"
+                deliverFallbackCopyWithToastLocked(text: text, toastMessage: toast, copyToClipboard: false)
+            default:
+                deliverFallbackCopyWithToastLocked(text: text, toastMessage: "未自动粘贴 · 已复制到剪贴板")
+            }
 
         case let .ready(preparation):
             setPhaseLocked(.revalidating)
@@ -1206,10 +1301,20 @@ public final class RequestCoordinator: @unchecked Sendable {
             )
 
             if let failReason {
-                // Immediately restore clipboard if we still own changeCount, then route to RecoveryPanel!
+                // Immediately restore clipboard if we still own changeCount.
+                // If clipboard drifted (user copied something new), do NOT overwrite their new clipboard!
+                let isClipboardDrift = failReason.contains("剪贴板有变化")
                 clipboardInjector.restoreIfOwned(preparation: preparation)
                 focusMonitor.stopMonitoring(requestID: requestID)
-                enterRecoveryWithTextLocked(text: text, reason: failReason, keepRetainedPCM: false)
+                if isClipboardDrift {
+                    deliverFallbackCopyWithToastLocked(
+                        text: text,
+                        toastMessage: "剪贴板有变化 · 已暂存至最近识别",
+                        copyToClipboard: false
+                    )
+                } else {
+                    deliverFallbackCopyWithToastLocked(text: text, toastMessage: failReason)
+                }
                 return
             }
 
@@ -1225,7 +1330,6 @@ public final class RequestCoordinator: @unchecked Sendable {
             // P1-1: Keep focusMonitor running THROUGH dispatchSyntheticPaste and verify synchronously
             // on clipboardQueue right before posting Cmd+V!
             let prePostGuard: @Sendable () -> Bool = { [focusMonitor, permissionManager] in
-                focusMonitor.currentFocusGeneration == focus.focusGeneration &&
                 focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate) &&
                 !permissionManager.isSecureEventInputEnabled() &&
                 !focusMonitor.isCurrentFocusedElementSecureTextField()
@@ -1240,14 +1344,19 @@ public final class RequestCoordinator: @unchecked Sendable {
                 guard let self else { return }
                 self.coordinatorQueue.async {
                     self.focusMonitor.stopMonitoring(requestID: requestID)
+                    guard self.activeRequestID == requestID && self.phase == .commitStarted else {
+                        return
+                    }
                     if !dispatched {
-                        self.enterRecoveryWithTextLocked(
+                        self.deliverFallbackCopyWithToastLocked(
                             text: text,
-                            reason: InjectionBlockReason.eventPostFailed.userMessage,
-                            keepRetainedPCM: false
+                            toastMessage: "未自动粘贴 · 已复制到剪贴板"
                         )
-                    } else if self.activeRequestID == requestID && self.phase == .commitStarted {
+                    } else {
                         self.recordLastCommittedTextLocked(text)
+                        if self.config.playFeedbackSounds {
+                            self.onCommitSuccessSound?()
+                        }
                         self.transitionToIdleLocked()
                     }
                 }
@@ -1265,31 +1374,27 @@ public final class RequestCoordinator: @unchecked Sendable {
         guard requestID == activeRequestID && phase == .revalidating else {
             return "本次输入已取消"
         }
-        // 2. focusGeneration unchanged, target pid+launchDate match;
-        //    in directTyping mode do NOT block solely on `!focus.axInitialized` because
-        //    Tier 2 direct Unicode typing works without AXObserver.
-        guard focusMonitor.currentFocusGeneration == focus.focusGeneration,
-              focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate),
+        // 2. target pid+launchDate match (tolerate same-app tab/sheet churn and switching away & back);
+        //    in directTyping mode do NOT block solely on `!focus.axInitialized`.
+        guard focusMonitor.isFrontmostMatching(pid: focus.pid, launchDate: focus.launchDate),
               (config.inputMode == .directTyping || focus.axInitialized)
         else {
-            return "刚刚切换了窗口，文字已为你安全保留"
+            return "已切换应用 · 已复制到剪贴板"
         }
         // 3. !IsSecureEventInputEnabled() AND not AXSecureTextField
         guard !permissionManager.isSecureEventInputEnabled(),
               !focus.isSecureTextField,
               !focusMonitor.isCurrentFocusedElementSecureTextField()
         else {
-            return "当前是密码输入框，为保护隐私已暂停自动输入"
+            return "密码框已暂停 · 已复制到剪贴板"
         }
         // 4. Live HID modifiers (excluding CapsLock) all clear AND atomic key debt clear
-        guard hotkeyController.areHIDModifiersClear(),
-              !triggerKeyDebtActive.load(ordering: .acquire)
-        else {
-            return "按键尚未松开，文字已为你保留在这里"
+        guard areHIDAndKeyDebtClearLocked() else {
+            return "按键尚未松开 · 已复制到剪贴板"
         }
         // 5. Terminal safety verified
         if isTerminalUnsafeLocked(text: text, bundleIdentifier: focus.bundleIdentifier) {
-            return InjectionBlockReason.terminalUnsafeCharacters.userMessage
+            return "终端含换行 · 已复制到剪贴板"
         }
         return nil
     }
@@ -1306,7 +1411,7 @@ public final class RequestCoordinator: @unchecked Sendable {
         }
         // 6. Pasteboard changeCount still equals what we wrote
         guard clipboardInjector.currentChangeCount() == preparation.expectedChangeCount else {
-            return InjectionBlockReason.changeCountMismatch.userMessage
+            return "剪贴板有变化 · 已复制到剪贴板"
         }
         return nil
     }
@@ -1388,31 +1493,80 @@ public final class RequestCoordinator: @unchecked Sendable {
             focusMonitor.stopMonitoring(requestID: activeRequestID)
         }
 
-        // Privacy guarantee: Esc / cancel immediately discards retained PCM & text.
+        // Privacy guarantee: Esc / cancel immediately discards retained PCM, text, and any active toast.
+        clearOverlayToastLocked()
         wipeAllPrivacyDataLocked()
         lastNoticeMessage = notice
         transitionToIdleLocked()
     }
 
+    private func deliverFallbackCopyWithToastLocked(
+        text: String,
+        toastMessage: String,
+        copyToClipboard: Bool = true
+    ) {
+        cancelPreCommitTimersLocked()
+        preCommitText = nil
+        retainedPCM = nil
+        retainedModelForRetry = nil
+        pcmRetentionTimer?.cancel()
+        pcmRetentionTimer = nil
+
+        recordLastCommittedTextLocked(text)
+        if copyToClipboard {
+            clipboardInjector.copyTextForUser(text)
+        }
+        if config.playFeedbackSounds {
+            onCommitSuccessSound?()
+        }
+        lastNoticeMessage = toastMessage
+        showOverlayToastLocked(toastMessage, durationSeconds: 2.5)
+        transitionToIdleLocked()
+    }
+
+    private func showOverlayToastLocked(_ message: String, durationSeconds: TimeInterval = 2.5) {
+        overlayToastTimer?.cancel()
+        activeOverlayToastMessage = message
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.activeOverlayToastMessage = nil
+            self.overlayToastTimer = nil
+            self.publishStateLocked()
+        }
+        overlayToastTimer = item
+        coordinatorQueue.asyncAfter(deadline: .now() + durationSeconds, execute: item)
+    }
+
+    private func clearOverlayToastLocked() {
+        overlayToastTimer?.cancel()
+        overlayToastTimer = nil
+        activeOverlayToastMessage = nil
+    }
+
     private func recordLastCommittedTextLocked(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        lastCommittedText = text
-        lastCommittedTextTimer?.cancel()
+        if recentHistory.first?.text != text {
+            recentHistory.insert(RecentTranscriptEntry(text: text, createdAt: nowProvider()), at: 0)
+            if recentHistory.count > Self.maxRecentHistoryCount {
+                recentHistory = Array(recentHistory.prefix(Self.maxRecentHistoryCount))
+            }
+        }
+        recentHistoryTimer?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.lastCommittedText = nil
-            self.lastCommittedTextTimer = nil
+            self.recentHistory.removeAll(keepingCapacity: false)
+            self.recentHistoryTimer = nil
             self.publishStateLocked()
         }
-        lastCommittedTextTimer = item
+        recentHistoryTimer = item
         coordinatorQueue.asyncAfter(deadline: .now() + timings.recoveryTextRetentionSeconds, execute: item)
     }
 
     private func clearLastCommittedTextLocked() {
-        lastCommittedTextTimer?.cancel()
-        lastCommittedTextTimer = nil
-        lastCommittedText = nil
+        recentHistoryTimer?.cancel()
+        recentHistoryTimer = nil
+        recentHistory.removeAll(keepingCapacity: false)
     }
 
     private func wipeAllPrivacyDataLocked() {
@@ -1532,30 +1686,48 @@ public final class RequestCoordinator: @unchecked Sendable {
 
         let overlayVisible: Bool
         let statusText: String
+        let toastText: String?
         switch phase {
         case .arming:
             overlayVisible = true
-            statusText = "正在启动麦克风…"
+            statusText = "正在启动…"
+            toastText = nil
         case .recording:
             overlayVisible = true
-            statusText = activeFirstFrameReceived ? "正在聆听…" : "准备聆听…"
+            statusText = activeFirstFrameReceived ? "正在聆听" : "准备聆听"
+            toastText = nil
         case .draining:
             overlayVisible = true
-            statusText = "正在整理语音…"
+            statusText = "整理语音…"
+            toastText = nil
         case .waitingWorkerReady:
             overlayVisible = true
             statusText = isCompilingMetalShaders
-                ? "首次启动语音引擎，稍等几秒…"
-                : "正在准备语音引擎…"
+                ? "首次加速中…"
+                : "准备引擎…"
+            toastText = nil
         case .transcribing:
             overlayVisible = true
-            statusText = "正在识别…"
+            statusText = "识别中…"
+            toastText = nil
         case .validating, .awaitingPreCommitReadiness, .preparingInjection, .revalidating, .commitStarted:
             overlayVisible = true
-            statusText = "正在输入文字…"
-        case .idle, .recovery:
+            statusText = "正在输入…"
+            toastText = nil
+        case .idle:
+            if let toast = activeOverlayToastMessage, !toast.isEmpty {
+                overlayVisible = true
+                statusText = toast
+                toastText = toast
+            } else {
+                overlayVisible = false
+                statusText = ""
+                toastText = nil
+            }
+        case .recovery:
             overlayVisible = false
             statusText = ""
+            toastText = nil
         }
 
         let overlay = RecordingOverlayState(
@@ -1568,7 +1740,8 @@ public final class RequestCoordinator: @unchecked Sendable {
             statusText: statusText,
             isCompilingMetalShaders: isCompilingMetalShaders,
             activeDeviceName: activeDeviceName,
-            noticeText: lastNoticeMessage
+            noticeText: lastNoticeMessage,
+            toastMessage: toastText
         )
 
         return CoordinatorSnapshotDelta(
@@ -1579,7 +1752,8 @@ public final class RequestCoordinator: @unchecked Sendable {
             isSecureInputPaused: isSecureInputPaused,
             overlay: overlay,
             recovery: recoveryPayload,
-            hasLastCommittedText: (lastCommittedText != nil),
+            hasLastCommittedText: !recentHistory.isEmpty,
+            recentHistory: recentHistory,
             isCoolingDown: isCurrentlyInToggleCooldownLocked(),
             lastErrorMessage: lastErrorMessage,
             lastNoticeMessage: lastNoticeMessage

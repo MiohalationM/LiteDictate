@@ -117,6 +117,8 @@ public final class AppController: @unchecked Sendable {
         modelProber: ModelProbing,
         modelRegistry: ModelRegistry? = nil,
         launchAtLoginManager: LaunchAtLoginManaging = LaunchAtLoginManager(),
+        onCaptureReadySound: (@Sendable () -> Void)? = nil,
+        onCommitSuccessSound: (@Sendable () -> Void)? = nil,
         onLimitTruncatedSound: (@Sendable () -> Void)? = nil,
         openURLHandler: (@Sendable (URL) -> Void)? = nil,
         relaunchHandler: (@Sendable () -> Void)? = nil,
@@ -164,6 +166,8 @@ public final class AppController: @unchecked Sendable {
             clipboardInjector: clipboardInjector,
             workerSupervisor: workerSupervisor,
             modelRegistry: registry,
+            onCaptureReadySound: onCaptureReadySound,
+            onCommitSuccessSound: onCommitSuccessSound,
             onLimitTruncatedSound: onLimitTruncatedSound,
             onOpenMicrophoneSettingsNeeded: {
                 openURL(permissionManager.settingsURL(for: .microphone))
@@ -221,6 +225,7 @@ public final class AppController: @unchecked Sendable {
             )
 
             permissionSnapshot = permissionManager.snapshot(eventTapAlive: hotkeyController.isTapAlive)
+            workerSupervisor.updateWarmTTLSeconds(config.modelIdleUnloadPolicy.ttlSeconds)
             launchAtLoginState = launchAtLoginManager.currentState()
             installWorkspaceLifecycleObservers()
             installPermissionPollingTimerLocked()
@@ -397,6 +402,12 @@ public final class AppController: @unchecked Sendable {
         case .copyLastCommittedText:
             coordinator.copyLastCommittedText()
 
+        case let .copyHistoryItem(id):
+            coordinator.copyHistoryItem(id: id)
+
+        case .clearRecentHistory:
+            coordinator.clearRecentHistory()
+
         case let .setPreferredLanguage(lang):
             config.preferredLanguage = lang
             saveConfigLocked()
@@ -416,6 +427,14 @@ public final class AppController: @unchecked Sendable {
             config.playFeedbackSounds = enabled
             saveConfigLocked()
             coordinator.updateConfig(config)
+            projectSnapshotLocked()
+
+        case let .setModelIdleUnloadPolicy(policy):
+            config.modelIdleUnloadPolicy = policy
+            saveConfigLocked()
+            workerSupervisor.updateWarmTTLSeconds(policy.ttlSeconds)
+            coordinator.updateConfig(config)
+            controllerNoticeMessage = "空闲模型释放已设为：\(policy.displayTitle)"
             projectSnapshotLocked()
 
         case let .setPasteRestoreDelayMs(delay):
@@ -682,6 +701,7 @@ public final class AppController: @unchecked Sendable {
             )
         }
         permissionSnapshot = permissionManager.snapshot(eventTapAlive: hotkeyController.isTapAlive)
+        coordinator.syncSecureInputState(permissionSnapshot.secureInputEnabled)
         launchAtLoginState = launchAtLoginManager.currentState()
         updatePermissionPollingCadenceLocked()
         projectSnapshotLocked()
@@ -763,7 +783,8 @@ public final class AppController: @unchecked Sendable {
         let delta = latestCoordinatorDelta
         let mergedError = delta.lastErrorMessage ?? controllerErrorMessage
         let mergedNotice = delta.lastNoticeMessage ?? controllerNoticeMessage
-        let securePaused = delta.isSecureInputPaused || permissionSnapshot.secureInputEnabled
+        // Query live Secure Input directly as the single source of truth so stale pause flags can never stick.
+        let securePaused = permissionManager.isSecureEventInputEnabled()
 
         let snapshot = AppStateSnapshot(
             phase: delta.phase,
@@ -785,11 +806,13 @@ public final class AppController: @unchecked Sendable {
             preferredLanguage: config.preferredLanguage,
             inputMode: config.inputMode,
             playFeedbackSounds: config.playFeedbackSounds,
+            modelIdleUnloadPolicy: config.modelIdleUnloadPolicy,
             launchAtLogin: launchAtLoginState,
             permissions: permissionSnapshot,
             overlay: delta.overlay,
             recovery: delta.recovery,
             hasLastCommittedText: delta.hasLastCommittedText,
+            recentHistory: delta.recentHistory,
             isCoolingDown: delta.isCoolingDown
         )
 

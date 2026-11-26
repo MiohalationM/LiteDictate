@@ -6,6 +6,15 @@ public enum HotkeyVirtualKeyCode {
     public static let ansiD: UInt16 = 0x02
     public static let ansiV: UInt16 = 0x09
     public static let escape: UInt16 = 0x35
+    public static let rightCommand: UInt16 = 0x36
+    public static let leftCommand: UInt16 = 0x37
+    public static let leftShift: UInt16 = 0x38
+    public static let leftOption: UInt16 = 0x3A
+    public static let leftControl: UInt16 = 0x3B
+    public static let rightShift: UInt16 = 0x3C
+    public static let rightOption: UInt16 = 0x3D
+    public static let rightControl: UInt16 = 0x3E
+    public static let function: UInt16 = 0x3F
 }
 
 /// Device-dependent left/right modifier mask bits from `<IOKit/hidsystem/IOLLEvent.h>`.
@@ -18,6 +27,7 @@ public enum DeviceModifierFlags {
     public static let leftOption: UInt64 = 0x0000_0020
     public static let rightOption: UInt64 = 0x0000_0040
     public static let rightControl: UInt64 = 0x0000_2000
+    public static let secondaryFn: UInt64 = CGEventFlags.maskSecondaryFn.rawValue
 }
 
 /// Normalized input events fed into `HotkeyDebtMachine`.
@@ -40,6 +50,7 @@ public struct RawKeyEvent: Equatable, Sendable {
     public let rawFlags: UInt64
     public let eventSourceUserData: Int64
     public let frontmostBundleID: String?
+    public let timestampNs: UInt64
 
     public init(
         kind: RawKeyEventKind,
@@ -47,7 +58,8 @@ public struct RawKeyEvent: Equatable, Sendable {
         isAutorepeat: Bool = false,
         rawFlags: UInt64 = 0,
         eventSourceUserData: Int64 = 0,
-        frontmostBundleID: String? = nil
+        frontmostBundleID: String? = nil,
+        timestampNs: UInt64 = 0
     ) {
         self.kind = kind
         self.keyCode = keyCode
@@ -55,6 +67,7 @@ public struct RawKeyEvent: Equatable, Sendable {
         self.rawFlags = rawFlags
         self.eventSourceUserData = eventSourceUserData
         self.frontmostBundleID = frontmostBundleID
+        self.timestampNs = timestampNs
     }
 }
 
@@ -108,9 +121,21 @@ public final class HotkeyDebtMachine {
     /// Set `true` after tap disabled / sleep / lock / Secure Input until all relevant keys are released.
     public private(set) var suppressUntilRelease: Bool = false
 
+    /// Chord-guard hold threshold for single-modifier Push-To-Talk (130 ms):
+    /// distinguishes intentional hold-to-speak from fast shortcut chords like Right ⌘ + C/V/Tab.
+    public static let singleModifierHoldThresholdNs: UInt64 = 130_000_000
+    /// Maximum tap duration for single-modifier Toggle mode (450 ms).
+    public static let singleModifierTapMaxNs: UInt64 = 450_000_000
+
     /// Tracks whether the trigger key was physically down when `suppressUntilRelease` engaged.
     public private(set) var waitingForTriggerReleaseAfterReset: Bool = false
     private var triggerKeyCodePendingReleaseAfterReset: UInt16?
+
+    /// Single-modifier key tracking state (Right ⌘, Right ⌥, Fn, etc.).
+    public private(set) var singleModifierHeld: Bool = false
+    public private(set) var pendingSingleModifierHold: Bool = false
+    private var singleModifierChordInterrupted: Bool = false
+    private var singleModifierDownTimestampNs: UInt64 = 0
 
     public init(
         binding: HotkeyBinding = .defaultBinding,
@@ -138,11 +163,145 @@ public final class HotkeyDebtMachine {
         suppressUntilRelease = false
         waitingForTriggerReleaseAfterReset = false
         triggerKeyCodePendingReleaseAfterReset = nil
+        singleModifierHeld = false
+        pendingSingleModifierHold = false
+        singleModifierChordInterrupted = false
+        singleModifierDownTimestampNs = 0
         triggerKeyDebtActive.store(false, ordering: .release)
+    }
+
+    /// Reconciles stale `swallowedTriggerKeyDown` / `triggerKeyDebtActive` when live HID confirms the
+    /// trigger key is no longer physically pressed (e.g., if a `keyUp` was dropped by macOS or another app).
+    @discardableResult
+    public func reconcileStaleTriggerKeyDebt(isKeyPhysicallyDown: (UInt16) -> Bool) -> [HotkeyEvent] {
+        guard swallowedTriggerKeyDown, let debtKeyCode = swallowedTriggerKeyCode else {
+            return []
+        }
+        guard !isKeyPhysicallyDown(debtKeyCode) else {
+            return []
+        }
+        swallowedTriggerKeyDown = false
+        swallowedTriggerKeyCode = nil
+        triggerKeyDebtActive.store(false, ordering: .release)
+
+        if pttActive, let gen = activePTTGeneration {
+            pttActive = false
+            activePTTGeneration = nil
+            return [.triggerStop(gestureGeneration: gen)]
+        }
+        return []
     }
 
     public func updateBinding(_ newBinding: HotkeyBinding) {
         self.binding = newBinding
+        singleModifierHeld = false
+        pendingSingleModifierHold = false
+        singleModifierChordInterrupted = false
+        singleModifierDownTimestampNs = 0
+    }
+
+    /// Fires a pending single-modifier Push-To-Talk hold after the 130 ms chord-guard window elapses
+    /// with no other key or extra modifier pressed.
+    public func firePendingSingleModifierHoldIfValid() -> HotkeyMachineDecision {
+        guard binding.kind == .singleModifier,
+              binding.triggerMode == .pushToTalk,
+              singleModifierHeld,
+              pendingSingleModifierHold,
+              !singleModifierChordInterrupted,
+              !suppressUntilRelease,
+              temporarilySuspended?.load(ordering: .acquire) != true
+        else {
+            pendingSingleModifierHold = false
+            return HotkeyMachineDecision(action: .passThrough)
+        }
+        pendingSingleModifierHold = false
+        gestureGeneration &+= 1
+        let gen = gestureGeneration
+        pttActive = true
+        activePTTGeneration = gen
+        return HotkeyMachineDecision(
+            action: .passThrough,
+            emittedEvents: [.triggerStart(gestureGeneration: gen)]
+        )
+    }
+
+    /// Returns whether the specific hardware modifier key `keyCode` is currently down in `rawFlags`.
+    public static func isSingleModifierDown(keyCode: UInt16, rawFlags: UInt64) -> Bool {
+        let flags = CGEventFlags(rawValue: rawFlags)
+        switch keyCode {
+        case HotkeyVirtualKeyCode.rightCommand:
+            if (rawFlags & DeviceModifierFlags.rightCommand) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.leftCommand) != 0 { return false }
+            return flags.contains(.maskCommand)
+        case HotkeyVirtualKeyCode.leftCommand:
+            if (rawFlags & DeviceModifierFlags.leftCommand) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.rightCommand) != 0 { return false }
+            return flags.contains(.maskCommand)
+        case HotkeyVirtualKeyCode.rightOption:
+            if (rawFlags & DeviceModifierFlags.rightOption) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.leftOption) != 0 { return false }
+            return flags.contains(.maskAlternate)
+        case HotkeyVirtualKeyCode.leftOption:
+            if (rawFlags & DeviceModifierFlags.leftOption) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.rightOption) != 0 { return false }
+            return flags.contains(.maskAlternate)
+        case HotkeyVirtualKeyCode.rightShift:
+            if (rawFlags & DeviceModifierFlags.rightShift) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.leftShift) != 0 { return false }
+            return flags.contains(.maskShift)
+        case HotkeyVirtualKeyCode.leftShift:
+            if (rawFlags & DeviceModifierFlags.leftShift) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.rightShift) != 0 { return false }
+            return flags.contains(.maskShift)
+        case HotkeyVirtualKeyCode.rightControl:
+            if (rawFlags & DeviceModifierFlags.rightControl) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.leftControl) != 0 { return false }
+            return flags.contains(.maskControl)
+        case HotkeyVirtualKeyCode.leftControl:
+            if (rawFlags & DeviceModifierFlags.leftControl) != 0 { return true }
+            if (rawFlags & DeviceModifierFlags.rightControl) != 0 { return false }
+            return flags.contains(.maskControl)
+        case HotkeyVirtualKeyCode.function:
+            return flags.contains(.maskSecondaryFn)
+        default:
+            return false
+        }
+    }
+
+    public static func hasExtraModifiersBesidesSingleTarget(keyCode: UInt16, rawFlags: UInt64) -> Bool {
+        let active = extractModifierMask(from: rawFlags)
+        let allowed = HotkeyBinding.singleModifierMask(for: keyCode)
+        if !active.subtracting(allowed).isEmpty {
+            return true
+        }
+        // Reject simultaneous opposite-side same modifier (e.g. Left ⌘ + Right ⌘)
+        switch keyCode {
+        case HotkeyVirtualKeyCode.rightCommand:
+            if (rawFlags & DeviceModifierFlags.leftCommand) != 0 { return true }
+        case HotkeyVirtualKeyCode.leftCommand:
+            if (rawFlags & DeviceModifierFlags.rightCommand) != 0 { return true }
+        case HotkeyVirtualKeyCode.rightOption:
+            if (rawFlags & DeviceModifierFlags.leftOption) != 0 { return true }
+        case HotkeyVirtualKeyCode.leftOption:
+            if (rawFlags & DeviceModifierFlags.rightOption) != 0 { return true }
+        case HotkeyVirtualKeyCode.rightShift:
+            if (rawFlags & DeviceModifierFlags.leftShift) != 0 { return true }
+        case HotkeyVirtualKeyCode.leftShift:
+            if (rawFlags & DeviceModifierFlags.rightShift) != 0 { return true }
+        case HotkeyVirtualKeyCode.rightControl:
+            if (rawFlags & DeviceModifierFlags.leftControl) != 0 { return true }
+        case HotkeyVirtualKeyCode.leftControl:
+            if (rawFlags & DeviceModifierFlags.rightControl) != 0 { return true }
+        default:
+            break
+        }
+        // Reject Fn combined with a non-Fn single-modifier target
+        if keyCode != HotkeyVirtualKeyCode.function,
+           CGEventFlags(rawValue: rawFlags).contains(.maskSecondaryFn)
+        {
+            return true
+        }
+        return false
     }
 
     public func updateDisabledBundleIDs(_ bundleIDs: Set<String>) {
@@ -154,6 +313,12 @@ public final class HotkeyDebtMachine {
     /// idle tap timeout, or Secure Input ending).
     public func clearSuppressionIfKeysReleased(currentRawFlags: UInt64) {
         guard suppressUntilRelease, !waitingForTriggerReleaseAfterReset else {
+            return
+        }
+        if binding.kind == .singleModifier && binding.keyCode == HotkeyVirtualKeyCode.function {
+            if !CGEventFlags(rawValue: currentRawFlags).contains(.maskSecondaryFn) {
+                suppressUntilRelease = false
+            }
             return
         }
         let currentMods = Self.extractModifierMask(from: currentRawFlags)
@@ -171,6 +336,10 @@ public final class HotkeyDebtMachine {
         currentRawFlags: UInt64
     ) {
         guard suppressUntilRelease, !waitingForTriggerReleaseAfterReset else {
+            return
+        }
+        if binding.kind == .singleModifier && incomingKind == .flagsChanged {
+            suppressUntilRelease = false
             return
         }
         let currentMods = Self.extractModifierMask(from: currentRawFlags)
@@ -315,6 +484,9 @@ public final class HotkeyDebtMachine {
 
         // RULE 4: Modifier flag transitions (never swallow flagsChanged).
         if event.kind == .flagsChanged {
+            if binding.kind == .singleModifier {
+                return handleSingleModifierFlagsChanged(event)
+            }
             if pttActive, let gen = activePTTGeneration {
                 // In PTT mode, releasing any required modifier ends the PTT gesture,
                 // while `swallowedTriggerKeyDown` stays true until trigger keyUp clears debt.
@@ -330,16 +502,35 @@ public final class HotkeyDebtMachine {
             return HotkeyMachineDecision(action: .passThrough)
         }
 
+        // Any non-modifier keyDown while a single-modifier trigger is held marks it as a normal chord
+        // (e.g. Right ⌘ + C / V / Tab) so we cancel any pending hold timer and never misfire dictation.
+        if binding.kind == .singleModifier && singleModifierHeld && event.kind == .keyDown {
+            singleModifierChordInterrupted = true
+            pendingSingleModifierHold = false
+        }
+
         // RULE 5: Global Escape cancellation — lock-free `acquire` read, never sync coordinator call.
         if event.kind == .keyDown, event.keyCode == HotkeyVirtualKeyCode.escape {
             let activeModifiers = Self.extractModifierMask(from: event.rawFlags)
-            // Only plain Escape (ignoring CapsLock) cancels; preserve Cmd+Opt+Esc etc.
-            if activeModifiers.isEmpty, shouldInterceptCancelEscape.load(ordering: .acquire) {
+            // Allow plain Escape (ignoring CapsLock), AND also allow Escape while holding the active
+            // single-modifier PTT key (e.g. holding Right ⌘ + pressing Esc cancels recording cleanly).
+            // Preserve system chords like Cmd+Opt+Esc (Force Quit).
+            let isHoldingOnlyActiveSingleModifierPTT =
+                pttActive &&
+                binding.kind == .singleModifier &&
+                activeModifiers == HotkeyBinding.singleModifierMask(for: binding.keyCode) &&
+                !Self.hasExtraModifiersBesidesSingleTarget(keyCode: binding.keyCode, rawFlags: event.rawFlags)
+
+            if (activeModifiers.isEmpty || isHoldingOnlyActiveSingleModifierPTT),
+               shouldInterceptCancelEscape.load(ordering: .acquire)
+            {
                 swallowedEscapeKeyDown = true
                 // Cancel any active PTT state so later trigger keyUp doesn't emit a redundant stop,
                 // while keeping `swallowedTriggerKeyDown` intact so the trigger keyUp is still swallowed.
                 pttActive = false
                 activePTTGeneration = nil
+                pendingSingleModifierHold = false
+                singleModifierChordInterrupted = true
                 return HotkeyMachineDecision(
                     action: .swallow,
                     emittedEvents: [.cancelEscape]
@@ -353,8 +544,9 @@ public final class HotkeyDebtMachine {
             return HotkeyMachineDecision(action: .passThrough)
         }
 
-        // RULE 7: New trigger chord detection.
-        if event.kind == .keyDown,
+        // RULE 7: New trigger chord detection (for `.keyCombo` bindings only).
+        if binding.kind == .keyCombo,
+           event.kind == .keyDown,
            !event.isAutorepeat,
            event.keyCode == binding.keyCode,
            Self.matchesModifiers(rawFlags: event.rawFlags, binding: binding)
@@ -385,6 +577,86 @@ public final class HotkeyDebtMachine {
         return HotkeyMachineDecision(action: .passThrough)
     }
 
+    private func handleSingleModifierFlagsChanged(_ event: RawKeyEvent) -> HotkeyMachineDecision {
+        if event.keyCode == binding.keyCode {
+            let isDown = Self.isSingleModifierDown(keyCode: binding.keyCode, rawFlags: event.rawFlags)
+            if isDown {
+                guard !singleModifierHeld else {
+                    return HotkeyMachineDecision(action: .passThrough)
+                }
+                if let bundleID = event.frontmostBundleID, disabledBundleIDs.contains(bundleID) {
+                    return HotkeyMachineDecision(action: .passThrough)
+                }
+                if Self.hasExtraModifiersBesidesSingleTarget(keyCode: binding.keyCode, rawFlags: event.rawFlags) {
+                    return HotkeyMachineDecision(action: .passThrough)
+                }
+                singleModifierHeld = true
+                singleModifierChordInterrupted = false
+                singleModifierDownTimestampNs = event.timestampNs
+                if binding.triggerMode == .pushToTalk {
+                    pendingSingleModifierHold = true
+                }
+                return HotkeyMachineDecision(action: .passThrough)
+            } else {
+                let wasHeld = singleModifierHeld
+                let wasInterrupted = singleModifierChordInterrupted
+                let downTs = singleModifierDownTimestampNs
+                singleModifierHeld = false
+                pendingSingleModifierHold = false
+                singleModifierChordInterrupted = false
+                singleModifierDownTimestampNs = 0
+
+                if pttActive, let gen = activePTTGeneration {
+                    pttActive = false
+                    activePTTGeneration = nil
+                    return HotkeyMachineDecision(
+                        action: .passThrough,
+                        emittedEvents: [.triggerStop(gestureGeneration: gen)]
+                    )
+                }
+
+                if wasHeld && !wasInterrupted && binding.triggerMode == .toggle {
+                    let durationOK: Bool
+                    if downTs > 0 && event.timestampNs >= downTs {
+                        durationOK = (event.timestampNs - downTs) <= Self.singleModifierTapMaxNs
+                    } else {
+                        durationOK = true
+                    }
+                    if durationOK {
+                        gestureGeneration &+= 1
+                        return HotkeyMachineDecision(
+                            action: .passThrough,
+                            emittedEvents: [.triggerToggle(gestureGeneration: gestureGeneration)]
+                        )
+                    }
+                }
+                return HotkeyMachineDecision(action: .passThrough)
+            }
+        }
+
+        // Another modifier changed while our single-modifier key is held -> chord!
+        if singleModifierHeld {
+            if Self.hasExtraModifiersBesidesSingleTarget(keyCode: binding.keyCode, rawFlags: event.rawFlags) {
+                singleModifierChordInterrupted = true
+                pendingSingleModifierHold = false
+            }
+            if !Self.isSingleModifierDown(keyCode: binding.keyCode, rawFlags: event.rawFlags) {
+                singleModifierHeld = false
+                pendingSingleModifierHold = false
+                singleModifierChordInterrupted = false
+                if pttActive, let gen = activePTTGeneration {
+                    pttActive = false
+                    activePTTGeneration = nil
+                    return HotkeyMachineDecision(
+                        action: .passThrough,
+                        emittedEvents: [.triggerStop(gestureGeneration: gen)]
+                    )
+                }
+            }
+        }
+        return HotkeyMachineDecision(action: .passThrough)
+    }
+
     private func handleSystemReset(reason: String) -> HotkeyMachineDecision {
         let hadTriggerHeld = swallowedTriggerKeyDown
         let heldKeyCode = swallowedTriggerKeyCode
@@ -394,6 +666,10 @@ public final class HotkeyDebtMachine {
         swallowedEscapeKeyDown = false
         pttActive = false
         activePTTGeneration = nil
+        singleModifierHeld = false
+        pendingSingleModifierHold = false
+        singleModifierChordInterrupted = false
+        singleModifierDownTimestampNs = 0
         triggerKeyDebtActive.store(false, ordering: .release)
 
         suppressUntilRelease = true

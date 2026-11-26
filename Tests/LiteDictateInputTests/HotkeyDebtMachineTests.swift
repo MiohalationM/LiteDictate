@@ -16,7 +16,7 @@ final class HotkeyDebtMachineTests: XCTestCase {
         DeviceModifierFlags.leftShift
 
     private func makeMachine(
-        binding: HotkeyBinding = .defaultBinding,
+        binding: HotkeyBinding = .cmdShiftD,
         disabledBundleIDs: Set<String> = []
     ) -> (HotkeyDebtMachine, AtomicBool, AtomicBool) {
         let shouldCancelEsc = AtomicBool(false)
@@ -476,7 +476,7 @@ final class HotkeyDebtMachineTests: XCTestCase {
         let triggerDebt = AtomicBool(false)
         let suspended = AtomicBool(false)
         let machine = HotkeyDebtMachine(
-            binding: .defaultBinding,
+            binding: .cmdShiftD,
             shouldInterceptCancelEscape: shouldCancelEsc,
             triggerKeyDebtActive: triggerDebt,
             temporarilySuspended: suspended
@@ -523,5 +523,247 @@ final class HotkeyDebtMachineTests: XCTestCase {
         XCTAssertTrue(controller.isTemporarilySuspended)
         controller.setTemporarilySuspended(false)
         XCTAssertFalse(controller.isTemporarilySuspended)
+    }
+
+    func testReconcileStaleTriggerKeyDebtClearsStuckDebtWhenLiveHIDShowsKeyReleased() {
+        let pttBinding = HotkeyBinding(
+            keyCode: HotkeyVirtualKeyCode.ansiD,
+            modifiers: [.command, .shift],
+            triggerMode: .pushToTalk
+        )
+        let (machine, _, triggerDebt) = makeMachine(binding: pttBinding)
+
+        // Start PTT chord -> debt is active
+        let start = machine.process(RawKeyEvent(kind: .keyDown, keyCode: HotkeyVirtualKeyCode.ansiD, rawFlags: cmdShiftFlags))
+        XCTAssertEqual(start.action, .swallow)
+        XCTAssertTrue(machine.swallowedTriggerKeyDown)
+        XCTAssertTrue(triggerDebt.load(ordering: .acquire))
+
+        // While live HID still reports D physically down, reconciliation MUST NOT clear debt
+        let stillDown = machine.reconcileStaleTriggerKeyDebt { _ in true }
+        XCTAssertTrue(stillDown.isEmpty)
+        XCTAssertTrue(machine.swallowedTriggerKeyDown)
+        XCTAssertTrue(triggerDebt.load(ordering: .acquire))
+
+        // Simulate dropped D keyUp: live HID reports D is NOT pressed -> debt clears & PTT stops cleanly!
+        let cleared = machine.reconcileStaleTriggerKeyDebt { _ in false }
+        XCTAssertEqual(cleared, [.triggerStop(gestureGeneration: 1)])
+        XCTAssertFalse(machine.swallowedTriggerKeyDown)
+        XCTAssertFalse(machine.pttActive)
+        XCTAssertFalse(triggerDebt.load(ordering: .acquire))
+    }
+
+    func testDefaultBindingIsRightCommandPTT() {
+        let def = HotkeyBinding.defaultBinding
+        XCTAssertEqual(def.kind, .singleModifier)
+        XCTAssertEqual(def.keyCode, HotkeyVirtualKeyCode.rightCommand)
+        XCTAssertEqual(def.triggerMode, .pushToTalk)
+        XCTAssertEqual(def.displayString, "右 ⌘")
+    }
+
+    func testSingleModifierRightCommandPTTChordGuardAndRelease() {
+        let (machine, _, _) = makeMachine(binding: .rightCommandPTT)
+        let rightCmdDownFlags: UInt64 = CGEventFlags.maskCommand.rawValue | DeviceModifierFlags.rightCommand
+        let leftCmdDownFlags: UInt64 = CGEventFlags.maskCommand.rawValue | DeviceModifierFlags.leftCommand
+
+        // 1. Left Command MUST be completely ignored when bound to Right Command
+        let leftDown = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.leftCommand,
+            rawFlags: leftCmdDownFlags,
+            timestampNs: 1_000_000_000
+        ))
+        XCTAssertEqual(leftDown.action, .passThrough)
+        XCTAssertTrue(leftDown.emittedEvents.isEmpty)
+        XCTAssertFalse(machine.pendingSingleModifierHold)
+
+        // 2. Right Command + C chord within 130ms MUST cancel pending hold and never misfire
+        let rCmdDown1 = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_000_000_000
+        ))
+        XCTAssertTrue(rCmdDown1.emittedEvents.isEmpty)
+        XCTAssertTrue(machine.pendingSingleModifierHold)
+
+        let cKeyDown = machine.process(RawKeyEvent(
+            kind: .keyDown,
+            keyCode: 0x08, // ANSI C
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_040_000_000
+        ))
+        XCTAssertEqual(cKeyDown.action, .passThrough)
+        XCTAssertTrue(cKeyDown.emittedEvents.isEmpty)
+        XCTAssertFalse(machine.pendingSingleModifierHold)
+        XCTAssertTrue(machine.firePendingSingleModifierHoldIfValid().emittedEvents.isEmpty)
+
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 2_100_000_000
+        ))
+        XCTAssertFalse(machine.pttActive)
+
+        // 3. Quick brush (<130ms) without firing hold timer MUST NOT start dictation
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 3_000_000_000
+        ))
+        XCTAssertTrue(machine.pendingSingleModifierHold)
+        let quickUp = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 3_060_000_000
+        ))
+        XCTAssertTrue(quickUp.emittedEvents.isEmpty)
+        XCTAssertFalse(machine.pendingSingleModifierHold)
+        XCTAssertFalse(machine.pttActive)
+
+        // 4. Proper Right Command PTT hold (>= 130ms) starts on timer and stops on release
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 4_000_000_000
+        ))
+        XCTAssertTrue(machine.pendingSingleModifierHold)
+        let started = machine.firePendingSingleModifierHoldIfValid()
+        XCTAssertEqual(started.emittedEvents, [.triggerStart(gestureGeneration: 1)])
+        XCTAssertTrue(machine.pttActive)
+
+        let stopped = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 5_000_000_000
+        ))
+        XCTAssertEqual(stopped.emittedEvents, [.triggerStop(gestureGeneration: 1)])
+        XCTAssertFalse(machine.pttActive)
+    }
+
+    func testSingleModifierToggleTapVsChordAndLongHold() {
+        var toggleRightCmd = HotkeyBinding.rightCommandPTT
+        toggleRightCmd.triggerMode = .toggle
+        let (machine, _, _) = makeMachine(binding: toggleRightCmd)
+        let rightCmdDownFlags: UInt64 = CGEventFlags.maskCommand.rawValue | DeviceModifierFlags.rightCommand
+
+        // 1. Clean quick tap (120ms <= 450ms) emits triggerToggle
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 1_000_000_000
+        ))
+        let tapUp = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 1_120_000_000
+        ))
+        XCTAssertEqual(tapUp.emittedEvents, [.triggerToggle(gestureGeneration: 1)])
+
+        // 2. Right Command + C chord does NOT emit toggle
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_000_000_000
+        ))
+        _ = machine.process(RawKeyEvent(
+            kind: .keyDown,
+            keyCode: 0x08,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_050_000_000
+        ))
+        let chordUp = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 2_120_000_000
+        ))
+        XCTAssertTrue(chordUp.emittedEvents.isEmpty)
+
+        // 3. Long hold (>450ms) does NOT emit toggle
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 3_000_000_000
+        ))
+        let longUp = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 3_600_000_000
+        ))
+        XCTAssertTrue(longUp.emittedEvents.isEmpty)
+    }
+
+    func testSingleModifierPTTEscapeCancelWhileHoldingRightCommandAndSecureInputReconcile() {
+        let (machine, shouldCancelEsc, _) = makeMachine(binding: .rightCommandPTT)
+        let rightCmdDownFlags: UInt64 = CGEventFlags.maskCommand.rawValue | DeviceModifierFlags.rightCommand
+        let bothCmdFlags: UInt64 = rightCmdDownFlags | DeviceModifierFlags.leftCommand
+
+        // 1. Holding Left Cmd + Right Cmd simultaneously MUST NOT start Right Cmd PTT
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: bothCmdFlags,
+            timestampNs: 1_000_000_000
+        ))
+        XCTAssertFalse(machine.pendingSingleModifierHold)
+
+        // 2. Start Right Cmd PTT, then press Esc while still holding Right Cmd -> MUST cancel!
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_000_000_000
+        ))
+        let started = machine.firePendingSingleModifierHoldIfValid()
+        XCTAssertEqual(started.emittedEvents, [.triggerStart(gestureGeneration: 1)])
+        XCTAssertTrue(machine.pttActive)
+        shouldCancelEsc.store(true, ordering: .release)
+
+        let escWhileHoldingRightCmd = machine.process(RawKeyEvent(
+            kind: .keyDown,
+            keyCode: HotkeyVirtualKeyCode.escape,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 2_500_000_000
+        ))
+        XCTAssertEqual(escWhileHoldingRightCmd.action, .swallow)
+        XCTAssertEqual(escWhileHoldingRightCmd.emittedEvents, [.cancelEscape])
+        XCTAssertFalse(machine.pttActive)
+
+        // Releasing Right Cmd after Esc cancel emits nothing
+        let releaseAfterCancel = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: 0,
+            timestampNs: 2_600_000_000
+        ))
+        XCTAssertTrue(releaseAfterCancel.emittedEvents.isEmpty)
+
+        // 3. After Secure Input ends, immediate Right Cmd press reconciles suppression on first try
+        _ = machine.process(RawKeyEvent(kind: .secureInputActivated))
+        XCTAssertTrue(machine.suppressUntilRelease)
+        machine.reconcileSuppressionAfterSecureInputEnded(
+            incomingKind: .flagsChanged,
+            incomingIsAutorepeat: false,
+            currentRawFlags: rightCmdDownFlags
+        )
+        XCTAssertFalse(machine.suppressUntilRelease)
+        _ = machine.process(RawKeyEvent(
+            kind: .flagsChanged,
+            keyCode: HotkeyVirtualKeyCode.rightCommand,
+            rawFlags: rightCmdDownFlags,
+            timestampNs: 3_000_000_000
+        ))
+        XCTAssertTrue(machine.pendingSingleModifierHold)
     }
 }

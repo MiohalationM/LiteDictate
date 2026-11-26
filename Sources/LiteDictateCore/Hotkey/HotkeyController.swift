@@ -24,6 +24,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
         var frontmostBundleID: String?
         var secureInputWasActive: Bool = false
         var secureInputPollTimer: CFRunLoopTimer?
+        var singleModifierHoldTimer: CFRunLoopTimer?
         var tapPort: CFMachPort?
         var runLoopSource: CFRunLoopSource?
         var runLoop: CFRunLoop?
@@ -194,6 +195,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
 
     public func updateBinding(_ binding: HotkeyBinding) {
         performOnTapThread { ctx in
+            HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
             ctx.machine.updateBinding(binding)
         }
     }
@@ -207,6 +209,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
     public func setTemporarilySuspended(_ suspended: Bool) {
         temporarilySuspendedAtomic.store(suspended, ordering: .release)
         performOnTapThread { ctx in
+            HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
             ctx.machine.resetDebtForSuspendOrResume()
             if !suspended,
                !IsSecureEventInputEnabled(),
@@ -226,6 +229,21 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
 
     public func currentHIDModifierMask() -> HotkeyModifierMask {
         Self.liveHIDModifierMask()
+    }
+
+    public func reconcileStaleTriggerKeyDebtWithLiveHID() {
+        performOnTapThread { ctx in
+            let emitted = ctx.machine.reconcileStaleTriggerKeyDebt { keyCode in
+                CGEventSource.keyState(.hidSystemState, key: CGKeyCode(keyCode))
+            }
+            if !emitted.isEmpty {
+                ctx.deliveryQueue.async {
+                    for evt in emitted {
+                        ctx.onEvent(evt)
+                    }
+                }
+            }
+        }
     }
 
     /// Real-time HID modifier probe using `CGEventSource.flagsState(.hidSystemState)`.
@@ -353,6 +371,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
 
     private func dispatchSyntheticSystemReset(_ kind: RawKeyEventKind) {
         performOnTapThread { ctx in
+            HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
             let decision = ctx.machine.process(RawKeyEvent(kind: kind))
             for evt in decision.emittedEvents {
                 ctx.deliveryQueue.async {
@@ -395,6 +414,9 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
                         CFRunLoopTimerInvalidate(timer)
                     }
                     tapCtx.secureInputPollTimer = nil
+                    tapCtx.deliveryQueue.async {
+                        tapCtx.onEvent(.secureInputEnded)
+                    }
                 }
             },
             &timerContext
@@ -412,11 +434,58 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
         }
     }
 
+    private static func armSingleModifierHoldTimerOnTapThread(for ctx: TapThreadContext) {
+        stopSingleModifierHoldTimerOnTapThread(for: ctx)
+        guard let rl = ctx.getRunLoop() else { return }
+        var timerContext = CFRunLoopTimerContext(
+            version: 0,
+            info: Unmanaged.passUnretained(ctx).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        let delaySec = Double(HotkeyDebtMachine.singleModifierHoldThresholdNs) / 1_000_000_000.0
+        let timer = CFRunLoopTimerCreate(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + delaySec,
+            0, // one-shot timer (0 idle wakeups!)
+            0,
+            0,
+            { _, info in
+                guard let info else { return }
+                let tapCtx = Unmanaged<TapThreadContext>.fromOpaque(info).takeUnretainedValue()
+                tapCtx.singleModifierHoldTimer = nil
+                let decision = tapCtx.machine.firePendingSingleModifierHoldIfValid()
+                if !decision.emittedEvents.isEmpty {
+                    let events = decision.emittedEvents
+                    tapCtx.deliveryQueue.async {
+                        for evt in events {
+                            tapCtx.onEvent(evt)
+                        }
+                    }
+                }
+            },
+            &timerContext
+        )
+        if let timer {
+            ctx.singleModifierHoldTimer = timer
+            CFRunLoopAddTimer(rl, timer, .commonModes)
+        }
+    }
+
+    private static func stopSingleModifierHoldTimerOnTapThread(for ctx: TapThreadContext) {
+        if let timer = ctx.singleModifierHoldTimer {
+            CFRunLoopTimerInvalidate(timer)
+            ctx.singleModifierHoldTimer = nil
+        }
+    }
+
     /// Idempotent tap-thread cleanup ensuring `CFRunLoopTimer`, `CFRunLoopSource`, and `CFMachPort`
     /// are cleanly disabled, removed, invalidated, and released with zero CF retain leaks (P1-14).
     private static func teardownTapResourcesOnTapThread(for ctx: TapThreadContext, runLoop: CFRunLoop) {
         ctx.tapAliveAtomic.store(false, ordering: .release)
         stopSecureInputPollTimerOnTapThread(for: ctx)
+        stopSingleModifierHoldTimerOnTapThread(for: ctx)
 
         if let source = ctx.runLoopSource {
             CFRunLoopRemoveSource(runLoop, source, .commonModes)
@@ -510,6 +579,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
 
         // Handle tap disabled notifications by resetting state and re-enabling if not in Secure Input.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
             let kind: RawKeyEventKind = (type == .tapDisabledByTimeout)
                 ? .tapDisabledByTimeout
                 : .tapDisabledByUserInput
@@ -536,6 +606,7 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
         if IsSecureEventInputEnabled() {
             if !ctx.secureInputWasActive {
                 ctx.secureInputWasActive = true
+                HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
                 let decision = ctx.machine.process(RawKeyEvent(kind: .secureInputActivated))
                 for emitted in decision.emittedEvents {
                     ctx.deliveryQueue.async {
@@ -569,6 +640,9 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
                 incomingIsAutorepeat: isAutorepeat,
                 currentRawFlags: event.flags.rawValue
             )
+            ctx.deliveryQueue.async {
+                ctx.onEvent(.secureInputEnded)
+            }
         }
 
         let keyCode = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
@@ -578,12 +652,31 @@ public final class HotkeyController: HotkeyControlling, @unchecked Sendable {
             isAutorepeat: isAutorepeat,
             rawFlags: event.flags.rawValue,
             eventSourceUserData: event.getIntegerValueField(.eventSourceUserData),
-            frontmostBundleID: ctx.frontmostBundleID
+            frontmostBundleID: ctx.frontmostBundleID,
+            timestampNs: DispatchTime.now().uptimeNanoseconds
         )
 
+        let wasPendingHold = ctx.machine.pendingSingleModifierHold
         let decision = ctx.machine.process(rawEvent)
-        if !decision.emittedEvents.isEmpty {
-            let events = decision.emittedEvents
+        if ctx.machine.pendingSingleModifierHold && !wasPendingHold {
+            HotkeyController.armSingleModifierHoldTimerOnTapThread(for: ctx)
+        } else if !ctx.machine.pendingSingleModifierHold && wasPendingHold {
+            HotkeyController.stopSingleModifierHoldTimerOnTapThread(for: ctx)
+        }
+        var emittedEvents = decision.emittedEvents
+        if eventKind == .flagsChanged,
+           ctx.machine.swallowedTriggerKeyDown,
+           HotkeyDebtMachine.extractModifierMask(from: event.flags.rawValue).isEmpty
+        {
+            let reconciled = ctx.machine.reconcileStaleTriggerKeyDebt { code in
+                CGEventSource.keyState(.hidSystemState, key: CGKeyCode(code))
+            }
+            if !reconciled.isEmpty {
+                emittedEvents.append(contentsOf: reconciled)
+            }
+        }
+        if !emittedEvents.isEmpty {
+            let events = emittedEvents
             ctx.deliveryQueue.async {
                 for emitted in events {
                     ctx.onEvent(emitted)

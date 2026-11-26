@@ -684,4 +684,126 @@ final class ClipboardInjectorTests: XCTestCase {
         XCTAssertTrue(restoredTypes.contains("org.chromium.web-custom-data"))
         XCTAssertTrue(restoredTypes.contains("dyn.ah62d4rv4gu8y6y4grf0gn5xbrzw1gydcr7u1e3cytf2gn"))
     }
+
+    func testBoundedImageSnapshotPreservesSmallScreenshotAndSafariTypesWhileBlockingHugeOrSensitiveClipboard() {
+        let pb = MockPasteboard()
+        let poster = RecordingPastePoster()
+        let injector = ClipboardInjector(
+            pasteboard: pb,
+            pastePoster: poster,
+            postEventAccessProbe: { true },
+            snapshotBudgetBytes: 2048,
+            minRestoreDelayMs: 10,
+            maxRestoreDelayMs: 700,
+            allowBoundedImageSnapshot: true
+        )
+
+        // 1. Small PNG screenshot (<= budget) snapshots and restores cleanly so Safari/Electron Cmd+V still works!
+        let smallPng = Data(repeating: 0x89, count: 512)
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: "public.png", data: smallPng),
+            ]),
+        ])
+        guard case let .ready(prep1) = syncPrepare(injector, text: "Safari输入", targetBundleID: "com.apple.Safari") else {
+            return XCTFail("Expected small screenshot to snapshot cleanly when allowBoundedImageSnapshot=true")
+        }
+        XCTAssertTrue(syncDispatch(injector, preparation: prep1, restoreDelayMs: 25))
+        let idleExp1 = expectation(description: "screenshot restored")
+        injector.whenIdle { idleExp1.fulfill() }
+        wait(for: [idleExp1], timeout: 2.0)
+        XCTAssertEqual(pb.currentItems().first?.representations.first?.type, "public.png")
+        XCTAssertEqual(pb.currentItems().first?.representations.first?.data, smallPng)
+
+        // 2. Safari rich webarchive / URL copy snapshots cleanly
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: ClipboardInjector.PasteboardMarkerType.utf8String, data: Data("https://apple.com".utf8)),
+                (type: "Apple URL pasteboard type", data: Data("https://apple.com".utf8)),
+                (type: "Apple Web Archive pasteboard type", data: Data("archive".utf8)),
+            ]),
+        ])
+        guard case let .ready(prep2) = syncPrepare(injector, text: "Safari网页输入", targetBundleID: "com.apple.Safari") else {
+            return XCTFail("Expected Safari webarchive/URL clipboard to snapshot cleanly")
+        }
+        injector.restoreIfOwned(preparation: prep2)
+        let idleExp2 = expectation(description: "safari clip restored")
+        injector.whenIdle { idleExp2.fulfill() }
+        wait(for: [idleExp2], timeout: 2.0)
+
+        // 3. Oversized PNG (> budget) is rejected without overwriting clipboard
+        let hugePng = Data(repeating: 0x77, count: 4096)
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: "public.png", data: hugePng),
+            ]),
+        ])
+        XCTAssertEqual(syncPrepare(injector, text: "dictated", targetBundleID: "com.apple.Safari"), .blocked(.snapshotExceededBudget))
+        XCTAssertEqual(pb.currentItems().first?.representations.first?.data, hugePng)
+
+        // 4. Concealed password and custom Figma binary remain strictly blocked 0-copy
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: ClipboardInjector.PasteboardMarkerType.concealed, data: Data()),
+                (type: ClipboardInjector.PasteboardMarkerType.utf8String, data: Data("pw".utf8)),
+            ]),
+        ])
+        XCTAssertEqual(syncPrepare(injector, text: "dictated"), .blocked(.concealedContent))
+
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: "com.figma.clipboard", data: Data([0x01, 0x02])),
+            ]),
+        ])
+        XCTAssertEqual(syncPrepare(injector, text: "dictated"), .blocked(.largeImageOrUnsupported))
+    }
+
+    func testArbitraryBoundedSnapshotHandlesUniversalClipboardPublicTextAndAppUTIsWhileProtectingSecretsAndPromises() {
+        let pb = MockPasteboard()
+        let poster = RecordingPastePoster()
+        let injector = ClipboardInjector(
+            pasteboard: pb,
+            pastePoster: poster,
+            postEventAccessProbe: { true },
+            snapshotBudgetBytes: 2048,
+            minRestoreDelayMs: 10,
+            maxRestoreDelayMs: 700,
+            allowArbitraryBoundedSnapshot: true
+        )
+
+        // Exact Universal Clipboard UTI combination seen on macOS (`public.text` + `public.url` + `is-remote-clipboard`)
+        pb.setItems([
+            PasteboardSnapshotItem(representations: [
+                (type: ClipboardInjector.PasteboardMarkerType.utf8String, data: Data("https://example.com".utf8)),
+                (type: "public.text", data: Data("https://example.com".utf8)),
+                (type: "public.url", data: Data("https://example.com".utf8)),
+                (type: "com.apple.is-remote-clipboard", data: Data()),
+                (type: "com.apple.linkpresentation.metadata", data: Data([0xAA, 0xBB])),
+            ]),
+        ])
+        guard case let .ready(prep) = syncPrepare(injector, text: "Safari直接输入", targetBundleID: "com.apple.Safari") else {
+            return XCTFail("Universal Clipboard & custom app UTIs <= 8 MiB must snapshot cleanly")
+        }
+        XCTAssertTrue(syncDispatch(injector, preparation: prep, restoreDelayMs: 25))
+        let idleExp = expectation(description: "universal clipboard restored")
+        injector.whenIdle { idleExp.fulfill() }
+        wait(for: [idleExp], timeout: 2.0)
+
+        let restoredTypes = Set(pb.currentItems().first?.representations.map(\.type) ?? [])
+        XCTAssertTrue(restoredTypes.contains("public.text"))
+        XCTAssertTrue(restoredTypes.contains("com.apple.linkpresentation.metadata"))
+
+        // Still strictly rejects concealed secrets, file promises, streaming media, and > budget items
+        pb.setItems([PasteboardSnapshotItem(representations: [(type: ClipboardInjector.PasteboardMarkerType.concealed, data: Data())])])
+        XCTAssertEqual(syncPrepare(injector, text: "x"), .blocked(.concealedContent))
+
+        pb.setItems([PasteboardSnapshotItem(representations: [(type: "com.apple.NSFilePromiseItemMetaData", data: Data([1]))])])
+        XCTAssertEqual(syncPrepare(injector, text: "x"), .blocked(.filePromise))
+
+        pb.setItems([PasteboardSnapshotItem(representations: [(type: "public.movie", data: Data([1]))])])
+        XCTAssertEqual(syncPrepare(injector, text: "x"), .blocked(.largeImageOrUnsupported))
+
+        pb.setItems([PasteboardSnapshotItem(representations: [(type: "public.png", data: Data(repeating: 0x01, count: 4096))])])
+        XCTAssertEqual(syncPrepare(injector, text: "x"), .blocked(.snapshotExceededBudget))
+    }
 }

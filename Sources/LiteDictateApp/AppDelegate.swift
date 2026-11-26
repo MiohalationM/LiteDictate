@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyController = HotkeyController()
         let permissionManager = PermissionManager()
         let focusMonitor = FocusMonitor()
-        let clipboardInjector = ClipboardInjector()
+        let clipboardInjector = ClipboardInjector(allowArbitraryBoundedSnapshot: true)
         let directInjector = DirectTextInjector(clipboardFallback: clipboardInjector)
         let workerSupervisor = WorkerSupervisor()
 
@@ -33,9 +33,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             clipboardInjector: clipboardInjector,
             workerSupervisor: workerSupervisor,
             modelProber: workerSupervisor,
+            onCaptureReadySound: {
+                DispatchQueue.main.async {
+                    if let sound = NSSound(named: NSSound.Name("Tink")) {
+                        sound.stop()
+                        sound.currentTime = 0
+                        sound.volume = 0.25
+                        sound.play()
+                    }
+                }
+            },
+            onCommitSuccessSound: {
+                DispatchQueue.main.async {
+                    if let sound = NSSound(named: NSSound.Name("Pop")) {
+                        sound.stop()
+                        sound.currentTime = 0
+                        sound.volume = 0.22
+                        sound.play()
+                    }
+                }
+            },
             onLimitTruncatedSound: {
                 DispatchQueue.main.async {
-                    NSSound(named: NSSound.Name("Pop"))?.play()
+                    if let sound = NSSound(named: NSSound.Name("Pop")) {
+                        sound.stop()
+                        sound.currentTime = 0
+                        sound.volume = 0.30
+                        sound.play()
+                    }
                 }
             },
             openSettingsWindowHandler: { [weak self] in

@@ -241,6 +241,35 @@ public enum TextInputMode: String, Codable, Equatable, Sendable {
     }
 }
 
+public enum ModelIdleUnloadPolicy: String, Codable, Equatable, CaseIterable, Sendable {
+    case immediately
+    case oneMinute
+    case twoMinutes
+    case fiveMinutes
+    case keepResident
+
+    /// Idle TTL in seconds (`0` = unload immediately after each job; `nil` = keep resident until memory pressure/sleep/lock/quit).
+    public var ttlSeconds: TimeInterval? {
+        switch self {
+        case .immediately: return 0
+        case .oneMinute: return 60
+        case .twoMinutes: return 120
+        case .fiveMinutes: return 300
+        case .keepResident: return nil
+        }
+    }
+
+    public var displayTitle: String {
+        switch self {
+        case .immediately: return "用完立即释放"
+        case .oneMinute: return "1 分钟后"
+        case .twoMinutes: return "2 分钟后（推荐）"
+        case .fiveMinutes: return "5 分钟后"
+        case .keepResident: return "保持常驻（仅内存紧张/锁屏时释放）"
+        }
+    }
+}
+
 public struct AppConfig: Codable, Equatable, Sendable {
     public var hotkey: HotkeyBinding
     public var audioSelection: AudioSelectionMode
@@ -251,6 +280,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
     public var aliasesPath: String
     public var inputMode: TextInputMode
     public var playFeedbackSounds: Bool
+    public var modelIdleUnloadPolicy: ModelIdleUnloadPolicy
 
     enum CodingKeys: String, CodingKey {
         case hotkey
@@ -262,6 +292,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         case aliasesPath
         case inputMode
         case playFeedbackSounds
+        case modelIdleUnloadPolicy
     }
 
     public init(
@@ -273,7 +304,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
         vocabPath: String,
         aliasesPath: String,
         inputMode: TextInputMode = .directTyping,
-        playFeedbackSounds: Bool = true
+        playFeedbackSounds: Bool = true,
+        modelIdleUnloadPolicy: ModelIdleUnloadPolicy = .twoMinutes
     ) {
         self.hotkey = hotkey
         self.audioSelection = audioSelection
@@ -287,6 +319,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         self.aliasesPath = aliasesPath
         self.inputMode = inputMode
         self.playFeedbackSounds = playFeedbackSounds
+        self.modelIdleUnloadPolicy = modelIdleUnloadPolicy
     }
 
     public init(from decoder: Decoder) throws {
@@ -305,6 +338,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         aliasesPath = try c.decodeIfPresent(String.self, forKey: .aliasesPath) ?? defaults.aliasesPath
         inputMode = try c.decodeIfPresent(TextInputMode.self, forKey: .inputMode) ?? .directTyping
         playFeedbackSounds = try c.decodeIfPresent(Bool.self, forKey: .playFeedbackSounds) ?? true
+        modelIdleUnloadPolicy = try c.decodeIfPresent(ModelIdleUnloadPolicy.self, forKey: .modelIdleUnloadPolicy) ?? .twoMinutes
     }
 
     public static func defaultAppSupportDirectory() -> URL {
@@ -323,7 +357,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
             vocabPath: appSupportDir.appendingPathComponent("vocab.txt").path,
             aliasesPath: appSupportDir.appendingPathComponent("aliases.json").path,
             inputMode: .directTyping,
-            playFeedbackSounds: true
+            playFeedbackSounds: true,
+            modelIdleUnloadPolicy: .twoMinutes
         )
     }
 }

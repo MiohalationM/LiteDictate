@@ -3,6 +3,9 @@ import ApplicationServices
 import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
+import os
+
+private let injectionLogger = Logger(subsystem: "io.github.litedictate", category: "Injection")
 
 /// Outcome of attempting Tier 1 verified Accessibility direct insertion (`kAXSelectedTextAttribute`).
 public enum AXDirectInsertResult: Equatable, Sendable {
@@ -828,6 +831,7 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
                         && currentFocusGeneration() == expectedFocusGeneration
                         && (targetPID <= 0 || self.frontmostPIDProvider() == targetPID)
                     if postIntact {
+                        injectionLogger.info("Injected via tier1_ax bundle=\(targetBundleIdentifier ?? "nil", privacy: .public) chars=\(text.count, privacy: .public)")
                         self.deliver(.inserted(method: .verifiedAccessibility), to: completion)
                     } else {
                         self.deliver(
@@ -918,6 +922,7 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
                     }
                     // Clipboard holds protected content (concealed secret, file promise, large image, Figma, >8 MiB,
                     // or pasteboard denied): clipboard was NOT touched. Fall back cleanly to Tier 3 Unicode stream!
+                    injectionLogger.notice("Tier2 clipboard skipped (\(blockReason.rawValue, privacy: .public)) for bundle=\(targetBundleIdentifier ?? "nil", privacy: .public); falling back to tier3_unicode")
                     self.runUnicodeKeystrokeStreamLocked(
                         text: text,
                         targetPID: targetPID,
@@ -967,6 +972,7 @@ public final class DirectTextInjector: DirectTextInjecting, @unchecked Sendable 
                     ) { [self] dispatched in
                         self.injectionQueue.async {
                             if dispatched {
+                                injectionLogger.info("Injected via tier2_clipboard bundle=\(targetBundleIdentifier ?? "nil", privacy: .public) chars=\(text.count, privacy: .public)")
                                 self.deliver(.inserted(method: .transientClipboardPaste), to: completion)
                                 return
                             }

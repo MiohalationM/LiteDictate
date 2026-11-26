@@ -49,4 +49,15 @@ public protocol FocusMonitoring: AnyObject, Sendable {
     func isCurrentFocusedElementSecureTextField() -> Bool
     func frontmostPID() -> pid_t?
     func frontmostBundleIdentifier() -> String?
+
+    /// Returns `true` ONLY when Accessibility positively confirms the focused element in a native
+    /// non-browser/non-Electron/non-terminal app is a non-editable surface (e.g. Finder Desktop, file list,
+    /// PDF viewer, button, or empty window) so we can auto-copy with a toast instead of causing a system beep.
+    func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?) -> Bool
+}
+
+public extension FocusMonitoring {
+    func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?) -> Bool {
+        false
+    }
 }

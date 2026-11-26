@@ -85,8 +85,13 @@ public protocol WorkerSupervising: AnyObject, Sendable {
     func submitTranscription(_ request: WorkerTranscriptionRequest)
     func cancelTranscription(requestID: RequestID)
     func requestModelSwitch(to model: ModelDescriptor?)
+    func updateWarmTTLSeconds(_ seconds: TimeInterval?)
     func shutdownGracefully(reason: String)
     func forceShutdownImmediately()
+}
+
+public extension WorkerSupervising {
+    func updateWarmTTLSeconds(_ seconds: TimeInterval?) {}
 }
 
 // MARK: - Warm Leak Self-Heal Tracker (Section 9.1)
@@ -145,7 +150,7 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
 
     private let supervisorQueue = DispatchQueue(label: "io.github.litedictate.worker.supervisor", qos: .userInitiated)
     private let explicitWorkerPath: String?
-    private let warmTTLSeconds: TimeInterval
+    private var warmTTLSeconds: TimeInterval?
     private let maxModelBytes: UInt64
     private let enableSystemMemoryPressureSource: Bool
 
@@ -203,7 +208,7 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
 
     public init(
         workerExecutablePath: String? = nil,
-        warmTTLSeconds: TimeInterval = LiteDictateConstants.warmTTLSeconds,
+        warmTTLSeconds: TimeInterval? = ModelIdleUnloadPolicy.twoMinutes.ttlSeconds,
         maxModelBytes: UInt64? = nil,
         enableSystemMemoryPressureSource: Bool = true
     ) {
@@ -813,7 +818,9 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
                 allowRespawnPendingAfterStop = false
                 beginGracefulShutdownLocked(killGraceMs: 1500)
             } else {
-                armWarmTTLTimerLocked(for: gen)
+                // Warmup finished while recording may still be in progress: never unload immediately
+                // even when policy is `.immediately` (ttl == 0); unload happens right after job finishes.
+                armWarmTTLTimerLocked(for: gen, allowImmediateUnload: false)
             }
 
         case .result:
@@ -1097,8 +1104,33 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
         instance.writeFrameAsync(frame)
     }
 
-    private func armWarmTTLTimerLocked(for gen: WorkerGeneration) {
+    public func updateWarmTTLSeconds(_ seconds: TimeInterval?) {
+        supervisorQueue.async {
+            self.warmTTLSeconds = seconds
+            if self.state == .warmModel, let instance = self.activeInstance {
+                self.armWarmTTLTimerLocked(for: instance.workerGeneration, allowImmediateUnload: true)
+            }
+        }
+    }
+
+    private func armWarmTTLTimerLocked(for gen: WorkerGeneration, allowImmediateUnload: Bool = true) {
         warmTTLTimer?.cancel()
+        warmTTLTimer = nil
+        guard let ttl = warmTTLSeconds else {
+            // Keep resident until memory pressure / sleep / lock / quit (0 idle timers).
+            return
+        }
+        let effectiveTTL: TimeInterval
+        if ttl <= 0 {
+            if allowImmediateUnload {
+                beginGracefulShutdownLocked(killGraceMs: 1500)
+                return
+            }
+            // Wait up to 45s while user finishes speaking; afterJobSettledLocked will unload immediately.
+            effectiveTTL = 45.0
+        } else {
+            effectiveTTL = ttl
+        }
         let item = DispatchWorkItem { [weak self] in
             guard let self,
                   let instance = self.activeInstance,
@@ -1108,7 +1140,7 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
             self.beginGracefulShutdownLocked(killGraceMs: 1500)
         }
         warmTTLTimer = item
-        supervisorQueue.asyncAfter(deadline: .now() + warmTTLSeconds, execute: item)
+        supervisorQueue.asyncAfter(deadline: .now() + effectiveTTL, execute: item)
     }
 
     private func armKillTimerLocked(for instance: WorkerProcessInstance, delayMs: Int) {

@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
+import UniformTypeIdentifiers
 
 /// Immutable representation of one pasteboard item's whitelisted representations.
 public struct PasteboardSnapshotItem: Equatable, Sendable {
@@ -102,7 +103,15 @@ public final class SystemPasteboardAdapter: PasteboardAccessing, @unchecked Send
         pb.clearContents()
         let item = NSPasteboardItem()
         for (type, data) in representations {
-            item.setData(data, forType: NSPasteboard.PasteboardType(type))
+            if type == NSPasteboard.PasteboardType.string.rawValue,
+               let str = String(data: data, encoding: .utf8)
+            {
+                // Use `setString(_:forType:)` for UTF-8 plain text so AppKit & WebKit/Safari
+                // see canonical string pasteboard representations.
+                item.setString(str, forType: .string)
+            } else {
+                item.setData(data, forType: NSPasteboard.PasteboardType(type))
+            }
         }
         guard pb.writeObjects([item]) else {
             return nil
@@ -168,8 +177,8 @@ public protocol SyntheticPastePosting: Sendable {
 /// using `.privateState`, explicit `.maskCommand` ONLY,
 /// and `eventSourceUserData = 0x4C444943` ("LDIC") on both `keyDown` and `keyUp`.
 public struct LiveSyntheticPastePoster: SyntheticPastePosting, Sendable {
-    public static let defaultPrePostSettleDelayNs: UInt64 = 12_000_000 // 12 ms for pboard commit
-    public static let defaultKeyDownToUpDelayNs: UInt64 = 10_000_000   // 10 ms Cmd+V hold
+    public static let defaultPrePostSettleDelayNs: UInt64 = 30_000_000 // 30 ms for pboard XPC commit (Safari WebContent)
+    public static let defaultKeyDownToUpDelayNs: UInt64 = 18_000_000   // 18 ms Cmd+V hold
 
     private let postEventAccessProbe: @Sendable () -> Bool
     private let prePostSettleDelayNs: UInt64
@@ -206,7 +215,7 @@ public struct LiveSyntheticPastePoster: SyntheticPastePosting, Sendable {
             return false
         }
 
-        let flags = CGEventFlags(rawValue: spec.flagsRawValue)
+        let flags = CGEventFlags(rawValue: spec.flagsRawValue).union(.maskNonCoalesced)
         keyDown.flags = flags
         keyDown.setIntegerValueField(.eventSourceUserData, value: spec.userData)
 
@@ -273,29 +282,53 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
     public static let whitelistedSnapshotTypes: Set<String> = [
         NSPasteboard.PasteboardType.string.rawValue,
         "NSStringPboardType",
+        "public.text",
         "public.utf16-plain-text",
         "public.utf16-external-plain-text",
         "public.plain-text",
         "com.apple.traditional-mac-plain-text",
         NSPasteboard.PasteboardType.rtf.rawValue,
+        "NSRTFPboardType",
         "NeXT Rich Text Format v1.0 pasteboard type",
         NSPasteboard.PasteboardType.html.rawValue,
+        "NSHTMLPboardType",
         "Apple HTML pasteboard type",
         "com.apple.webarchive",
+        "Apple Web Archive pasteboard type",
         "com.apple.cocoa.pasteboard.character-formatting",
         "com.apple.cocoa.pasteboard.paragraph-formatting",
+        "com.apple.cocoa.pasteboard.color",
+        "com.apple.cocoa.pasteboard.font",
         "com.apple.notes.richtext",
+        "com.apple.notes.richtext.legacy",
         NSPasteboard.PasteboardType.URL.rawValue,
+        "Apple URL pasteboard type",
         NSPasteboard.PasteboardType.fileURL.rawValue,
+        "NSFilenamesPboardType",
         NSPasteboard.PasteboardType.tabularText.rawValue,
+        "NSTabularTextPboardType",
         "public.url-name",
         "WebURLsWithTitlesPboardType",
         "CorePasteboardFlavorType 0x75726C20",
         "CorePasteboardFlavorType 0x75726C6E",
         "org.chromium.source-url",
         "org.chromium.web-custom-data",
+        "org.chromium.image-html",
         "org.chromium.internal.source-url",
         "org.chromium.internal.source-rfh-token",
+        "com.apple.safari.bookmark",
+    ]
+
+    /// Standard still-image types that may be snapshotted strictly within the 8 MiB budget when
+    /// `allowBoundedImageSnapshot == true` (e.g. preserving macOS screenshots while pasting into Safari/Electron).
+    private static let boundedImageSnapshotTypes: Set<String> = [
+        NSPasteboard.PasteboardType.png.rawValue,
+        NSPasteboard.PasteboardType.tiff.rawValue,
+        "public.jpeg",
+        "public.heic",
+        "public.heif",
+        "public.image",
+        "NeXT TIFF v4.0 pasteboard type",
     ]
 
     /// Plain-text types that qualify companion LaunchServices dynamic UTIs (`dyn.*`, e.g. VS Code / Electron editor metadata)
@@ -347,8 +380,25 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
         "Pasteboard generator type",
     ]
 
-    private static func isSnapshotEligibleType(_ type: String, itemHasPlainTextAnchor: Bool) -> Bool {
+    /// Streaming media types that are ALWAYS rejected zero-copy even in bounded arbitrary snapshot mode.
+    private static let streamingMediaTypes: Set<String> = [
+        "public.movie",
+        "public.audio",
+    ]
+
+    private static func isSnapshotEligibleType(
+        _ type: String,
+        itemHasPlainTextAnchor: Bool,
+        allowBoundedImageSnapshot: Bool = false,
+        allowArbitraryBoundedSnapshot: Bool = false
+    ) -> Bool {
+        if allowArbitraryBoundedSnapshot {
+            return !benignMarkerOnlyTypes.contains(type) && !streamingMediaTypes.contains(type)
+        }
         if whitelistedSnapshotTypes.contains(type) {
+            return true
+        }
+        if allowBoundedImageSnapshot && boundedImageSnapshotTypes.contains(type) {
             return true
         }
         // macOS synthesizes `dyn.*` UTIs for browser/editor custom MIME metadata (e.g. VS Code `vscode-editor-data`).
@@ -373,6 +423,8 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
     private let snapshotBudgetBytes: Int
     private let minRestoreDelayMs: Int
     private let maxRestoreDelayMs: Int
+    private let allowBoundedImageSnapshot: Bool
+    private let allowArbitraryBoundedSnapshot: Bool
 
     private let clipboardQueue = DispatchQueue(
         label: "io.github.litedictate.clipboard.serial",
@@ -398,7 +450,9 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
         extraTerminalBundleIDs: Set<String> = [],
         snapshotBudgetBytes: Int = LiteDictateConstants.clipboardSnapshotBudgetBytes,
         minRestoreDelayMs: Int = LiteDictateConstants.minPasteRestoreDelayMs,
-        maxRestoreDelayMs: Int = LiteDictateConstants.maxPasteRestoreDelayMs
+        maxRestoreDelayMs: Int = LiteDictateConstants.maxPasteRestoreDelayMs,
+        allowBoundedImageSnapshot: Bool = false,
+        allowArbitraryBoundedSnapshot: Bool = false
     ) {
         self.pasteboard = pasteboard
         self.pastePoster = pastePoster
@@ -409,6 +463,8 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
         self.snapshotBudgetBytes = snapshotBudgetBytes
         self.minRestoreDelayMs = max(0, minRestoreDelayMs)
         self.maxRestoreDelayMs = max(self.minRestoreDelayMs, maxRestoreDelayMs)
+        self.allowBoundedImageSnapshot = allowBoundedImageSnapshot
+        self.allowArbitraryBoundedSnapshot = allowArbitraryBoundedSnapshot
     }
 
     public var readiness: ClipboardReadiness {
@@ -487,14 +543,18 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
 
             // 4. Tier 1: Zero-copy metadata prescreening of all pasteboard types.
             let metadataItems = self.pasteboard.inspectItemMetadata()
-            if let blockReason = Self.prescreenMetadata(metadataItems) {
+            if let blockReason = Self.prescreenMetadata(
+                metadataItems,
+                allowBoundedImageSnapshot: self.allowBoundedImageSnapshot,
+                allowArbitraryBoundedSnapshot: self.allowArbitraryBoundedSnapshot
+            ) {
                 self.callbackQueue.async {
                     completion(.blocked(blockReason))
                 }
                 return
             }
 
-            // 5. Tier 2: Bounded 8 MiB snapshot of whitelisted formats ONLY (P1-3 & P1-4).
+            // 5. Tier 2: Bounded 8 MiB snapshot of eligible formats ONLY (P1-3 & P1-4).
             var snapshot: [PasteboardSnapshotItem] = []
             var totalBytes = 0
 
@@ -502,8 +562,12 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
                 let hasPlainTextAnchor = meta.types.contains { Self.plainTextAnchorTypes.contains($0) }
                 // P1-3: Never silently destroy custom non-whitelisted representations even when text is also present.
                 let hasUnsupportedNonMarker = meta.types.contains {
-                    !Self.isSnapshotEligibleType($0, itemHasPlainTextAnchor: hasPlainTextAnchor)
-                        && !Self.benignMarkerOnlyTypes.contains($0)
+                    !Self.isSnapshotEligibleType(
+                        $0,
+                        itemHasPlainTextAnchor: hasPlainTextAnchor,
+                        allowBoundedImageSnapshot: self.allowBoundedImageSnapshot,
+                        allowArbitraryBoundedSnapshot: self.allowArbitraryBoundedSnapshot
+                    ) && !Self.benignMarkerOnlyTypes.contains($0)
                 }
                 if hasUnsupportedNonMarker {
                     snapshot.removeAll(keepingCapacity: false)
@@ -514,7 +578,12 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
                 }
 
                 let snapshotTypes = meta.types.filter {
-                    Self.isSnapshotEligibleType($0, itemHasPlainTextAnchor: hasPlainTextAnchor)
+                    Self.isSnapshotEligibleType(
+                        $0,
+                        itemHasPlainTextAnchor: hasPlainTextAnchor,
+                        allowBoundedImageSnapshot: self.allowBoundedImageSnapshot,
+                        allowArbitraryBoundedSnapshot: self.allowArbitraryBoundedSnapshot
+                    )
                 }
                 if snapshotTypes.isEmpty {
                     continue
@@ -729,7 +798,11 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
     // MARK: - Tier 1 Prescreening
 
     /// Pure zero-copy metadata check over pasteboard item types.
-    public static func prescreenMetadata(_ items: [PasteboardItemMetadata]) -> InjectionBlockReason? {
+    public static func prescreenMetadata(
+        _ items: [PasteboardItemMetadata],
+        allowBoundedImageSnapshot: Bool = false,
+        allowArbitraryBoundedSnapshot: Bool = false
+    ) -> InjectionBlockReason? {
         for item in items {
             for type in item.types {
                 if type == PasteboardMarkerType.concealed || type.localizedCaseInsensitiveContains("concealedtype") {
@@ -752,10 +825,25 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
 
         for item in items {
             for type in item.types {
+                if allowArbitraryBoundedSnapshot {
+                    if streamingMediaTypes.contains(type)
+                        || UTType(type)?.conforms(to: .audiovisualContent) == true
+                    {
+                        return .largeImageOrUnsupported
+                    }
+                    continue
+                }
                 if riskyLargeImageTypes.contains(type) {
+                    if allowBoundedImageSnapshot && boundedImageSnapshotTypes.contains(type) {
+                        continue
+                    }
                     return .largeImageOrUnsupported
                 }
             }
+        }
+
+        if allowArbitraryBoundedSnapshot {
+            return nil
         }
 
         // P1-3: Reject any item carrying a non-marker representation outside snapshot-eligible types
@@ -763,8 +851,12 @@ public final class ClipboardInjector: ClipboardInjecting, @unchecked Sendable {
         for item in items {
             let hasPlainTextAnchor = item.types.contains { plainTextAnchorTypes.contains($0) }
             for type in item.types {
-                if !isSnapshotEligibleType(type, itemHasPlainTextAnchor: hasPlainTextAnchor)
-                    && !benignMarkerOnlyTypes.contains(type)
+                if !isSnapshotEligibleType(
+                    type,
+                    itemHasPlainTextAnchor: hasPlainTextAnchor,
+                    allowBoundedImageSnapshot: allowBoundedImageSnapshot,
+                    allowArbitraryBoundedSnapshot: allowArbitraryBoundedSnapshot
+                ) && !benignMarkerOnlyTypes.contains(type)
                 {
                     return .largeImageOrUnsupported
                 }

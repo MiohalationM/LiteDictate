@@ -47,8 +47,8 @@ public enum LiteDictateConstants {
 
     public static let maxVocabEntries: Int = 50
     public static let toggleCooldownMs: Int = 600
-    public static let preCommitHIDWaitMaxMs: Int = 500
-    public static let defaultPasteRestoreDelayMs: Int = 400
+    public static let preCommitHIDWaitMaxMs: Int = 2_000
+    public static let defaultPasteRestoreDelayMs: Int = 550
     public static let minPasteRestoreDelayMs: Int = 200
     public static let maxPasteRestoreDelayMs: Int = 700
     public static let clipboardSnapshotBudgetBytes: Int = 8 * 1024 * 1024

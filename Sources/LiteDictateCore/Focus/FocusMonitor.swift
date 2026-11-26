@@ -46,6 +46,16 @@ public protocol FocusMonitorBackend: AnyObject, Sendable {
     /// Checks `IsSecureEventInputEnabled()` and current AX focused element role/subrole.
     /// NEVER queries `kAXMarkedTextRangeAttribute` (WeType red line).
     func isCurrentFocusedElementSecureTextField(timeoutSeconds: Float) -> Bool
+
+    /// Returns `true` ONLY when Accessibility positively confirms the focused element is a non-editable
+    /// native AppKit control (e.g. Finder Desktop / ScrollArea / Outline / Button / Window) rather than a text box.
+    func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?, timeoutSeconds: Float) -> Bool
+}
+
+public extension FocusMonitorBackend {
+    func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?, timeoutSeconds: Float) -> Bool {
+        false
+    }
 }
 
 /// Production macOS backend attaching `AXObserver` strictly to `CFRunLoopGetMain()`.
@@ -209,6 +219,115 @@ public final class LiveFocusMonitorBackend: FocusMonitorBackend, @unchecked Send
         let element = (focusedValue as! AXUIElement)
         AXUIElementSetMessagingTimeout(element, timeoutSeconds)
         return Self.isElementSecureTextField(element)
+    }
+
+    /// Leaf controls that are unambiguously non-editable across native macOS apps.
+    private static let knownNonEditableLeafRoles: Set<String> = [
+        "AXButton",
+        "AXCheckBox",
+        "AXRadioButton",
+        "AXPopUpButton",
+        "AXImage",
+        "AXToolbar",
+        "AXMenuBar",
+        "AXMenu",
+    ]
+
+    /// Container roles that are non-editable ONLY in known native non-editor Apple apps
+    /// (never applied to arbitrary 3rd-party Electron/CEF/Tauri/custom-drawn apps where
+    /// focused editors frequently report AXWindow/AXScrollArea).
+    private static let knownNonEditableContainerRoles: Set<String> = [
+        "AXWindow",
+        "AXApplication",
+        "AXScrollArea",
+        "AXOutline",
+        "AXTable",
+        "AXList",
+        "AXBrowser",
+        "AXIconGroup",
+        "AXTabGroup",
+        "AXSplitGroup",
+    ]
+
+    private static let knownNativeNonEditorBundleIDs: Set<String> = [
+        "com.apple.finder",
+        "com.apple.preview",
+        "com.apple.systempreferences",
+        "com.apple.systemsettings",
+        "com.apple.activitymonitor",
+        "com.apple.music",
+        "com.apple.photos",
+        "com.apple.books",
+        "com.apple.appstore",
+        "com.apple.podcasts",
+        "com.apple.tv",
+        "com.apple.maps",
+        "com.apple.weather",
+        "com.apple.stocks",
+        "com.apple.home",
+    ]
+
+    public func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?, timeoutSeconds: Float) -> Bool {
+        // Never assume non-editable for browsers, Electron, Qt, JetBrains, or Terminals where AX roles
+        // frequently report AXWebArea/AXGroup/AXUnknown even when an input box IS actively focused.
+        let normalizedBundleID = bundleIdentifier?.lowercased()
+        if let bundleID = normalizedBundleID, !bundleID.isEmpty {
+            if DirectTextInjector.axUnreliableBundleIDs.contains(bundleID)
+                || ClipboardInjector.defaultTerminalBundleIDs.contains(bundleID)
+                || bundleID.hasPrefix("com.jetbrains.")
+                || bundleID.contains("electron")
+                || bundleID.contains("t3code")
+                || bundleID.contains("t3.code")
+                || bundleID.contains("t3-code")
+            {
+                return false
+            }
+        }
+        guard AXIsProcessTrusted() else {
+            return false
+        }
+
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, timeoutSeconds)
+
+        var focusedValue: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        )
+        guard err == .success, let focusedValue, CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
+            return false
+        }
+        let element = (focusedValue as! AXUIElement)
+        AXUIElementSetMessagingTimeout(element, timeoutSeconds)
+
+        var isSettable: DarwinBoolean = false
+        if AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &isSettable) == .success,
+           isSettable.boolValue
+        {
+            return false
+        }
+
+        var roleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
+              let role = roleValue as? String
+        else {
+            return false
+        }
+        if LiveAXDirectInserter.allowedNativeTextRoles.contains(role) || role == "AXWebArea" {
+            return false
+        }
+        if Self.knownNonEditableLeafRoles.contains(role) {
+            return true
+        }
+        if let bundleID = normalizedBundleID,
+           Self.knownNativeNonEditorBundleIDs.contains(bundleID),
+           Self.knownNonEditableContainerRoles.contains(role)
+        {
+            return true
+        }
+        return false
     }
 
     /// Compares initial and current focused window references using `CFEqual`.
@@ -404,6 +523,13 @@ public final class FocusMonitor: FocusMonitoring, @unchecked Sendable {
 
     public func frontmostBundleIdentifier() -> String? {
         backend.frontmostApplication()?.bundleIdentifier
+    }
+
+    public func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?) -> Bool {
+        backend.isCurrentFocusedElementKnownNonEditable(
+            bundleIdentifier: bundleIdentifier,
+            timeoutSeconds: timeoutSeconds
+        )
     }
 
     /// Triggers a monotonic `focusGeneration` increment and notifies any active request asynchronously.

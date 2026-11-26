@@ -203,6 +203,8 @@ private final class StubWorkerSupervisor: WorkerSupervising, ModelProbing, @unch
     var currentState: WorkerLifecycleState { .stopped }
     var currentMemoryPressure: MemoryPressureLevel { .normal }
     var currentFootprintBytes: UInt64 { 0 }
+    private let ttlLock = NSLock()
+    var lastUpdatedWarmTTL: TimeInterval??
     var probeHandler: @Sendable (String) -> Result<LDPProbeResultPayload, ModelProbeError> = { path in
         .success(LDPProbeResultPayload(
             modelPath: path,
@@ -220,6 +222,11 @@ private final class StubWorkerSupervisor: WorkerSupervising, ModelProbing, @unch
     func submitTranscription(_ request: WorkerTranscriptionRequest) {}
     func cancelTranscription(requestID: RequestID) {}
     func requestModelSwitch(to model: ModelDescriptor?) {}
+    func updateWarmTTLSeconds(_ seconds: TimeInterval?) {
+        ttlLock.lock()
+        lastUpdatedWarmTTL = .some(seconds)
+        ttlLock.unlock()
+    }
     func shutdownGracefully(reason: String) {}
     func forceShutdownImmediately() {}
 
@@ -560,6 +567,80 @@ struct AppControllerTests {
         let decoded = try JSONDecoder().decode(AppConfig.self, from: Data(legacyJSON.utf8))
         #expect(decoded.inputMode == .directTyping)
         #expect(decoded.playFeedbackSounds == true)
+        #expect(decoded.modelIdleUnloadPolicy == .twoMinutes)
         #expect(decoded.pasteRestoreDelayMs == 400)
+        #expect(decoded.hotkey.kind == .keyCombo)
+        #expect(decoded.hotkey.keyCode == 2)
+    }
+
+    @Test("ModelIdleUnloadPolicy updates WorkerSupervisor TTL and Secure Input clears immediately without sticking")
+    func testModelIdleUnloadPolicyAndLiveSecureInputClearing() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = await MainActor.run { AppStateStore() }
+        let worker = StubWorkerSupervisor()
+        let perms = StubPermissionManager()
+        perms.grantInputMonitoringAndAccessibility()
+
+        let controller = AppController(
+            appSupportDirectory: dir,
+            stateStore: store,
+            audioDeviceManager: StubAudioDeviceManager(),
+            audioCapture: StubAudioCapture(),
+            hotkeyController: StubHotkeyController(),
+            permissionManager: perms,
+            focusMonitor: StubFocusMonitor(),
+            directInjector: StubDirectTextInjector(),
+            clipboardInjector: StubClipboardInjector(),
+            workerSupervisor: worker,
+            modelProber: worker,
+            modelRegistry: ModelRegistry(appSupportDirectory: dir, discoveryDirectories: []),
+            openURLHandler: { _ in },
+            relaunchHandler: {},
+            settingsFallbackDelay: 0.02
+        )
+        controller.start()
+        try? await Task.sleep(for: .milliseconds(40))
+
+        // Default policy is .twoMinutes (120s)
+        let initSnap = await MainActor.run { store.snapshot }
+        #expect(initSnap.modelIdleUnloadPolicy == .twoMinutes)
+        #expect(worker.lastUpdatedWarmTTL == .some(120))
+
+        // Change policy to .immediately (0s) and .keepResident (nil)
+        controller.dispatch(.setModelIdleUnloadPolicy(.immediately))
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(await MainActor.run { store.snapshot.modelIdleUnloadPolicy } == .immediately)
+        #expect(worker.lastUpdatedWarmTTL == .some(0))
+
+        controller.dispatch(.setModelIdleUnloadPolicy(.keepResident))
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(await MainActor.run { store.snapshot.modelIdleUnloadPolicy } == .keepResident)
+        #expect(worker.lastUpdatedWarmTTL == .some(nil))
+
+        // Secure Input toggles true -> false -> refreshPermissions immediately un-pauses without sticking
+        perms.secureInputEnabled = true
+        controller.dispatch(.refreshPermissions)
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(await MainActor.run { store.snapshot.isSecureInputPaused } == true)
+
+        perms.secureInputEnabled = false
+        controller.dispatch(.refreshPermissions)
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(await MainActor.run { store.snapshot.isSecureInputPaused } == false)
+
+        controller.dispatch(.prepareForQuit)
+        try? await Task.sleep(for: .milliseconds(30))
+    }
+
+    @Test("HotkeyBinding singleModifier preset encodes and decodes cleanly")
+    func testSingleModifierHotkeyCodableRoundTrip() throws {
+        let preset = HotkeyBinding.rightCommandPTT
+        let data = try JSONEncoder().encode(preset)
+        let decoded = try JSONDecoder().decode(HotkeyBinding.self, from: data)
+        #expect(decoded == preset)
+        #expect(decoded.kind == .singleModifier)
+        #expect(decoded.displayString == "右 ⌘")
     }
 }

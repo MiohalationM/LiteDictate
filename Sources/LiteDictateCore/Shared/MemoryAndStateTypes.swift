@@ -95,6 +95,29 @@ public struct RecoveryPayload: Equatable, Sendable {
     }
 }
 
+/// Single in-memory recent dictation entry (max 5 kept in RAM, cleared on sleep/lock/quit, 0 disk, 0 logs).
+public struct RecentTranscriptEntry: Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public let text: String
+    public let createdAt: Date
+
+    public init(id: UUID = UUID(), text: String, createdAt: Date = Date()) {
+        self.id = id
+        self.text = text
+        self.createdAt = createdAt
+    }
+
+    /// Compact single-line preview for menu bar display.
+    public func menuPreview(maxCharacters: Int = 22) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > maxCharacters else { return collapsed }
+        return String(collapsed.prefix(maxCharacters)) + "…"
+    }
+}
+
 public struct RecordingOverlayState: Equatable, Sendable {
     public let isVisible: Bool
     public let phase: InteractionPhase
@@ -106,6 +129,11 @@ public struct RecordingOverlayState: Equatable, Sendable {
     public let isCompilingMetalShaders: Bool
     public let activeDeviceName: String?
     public let noticeText: String?
+    public let toastMessage: String?
+
+    public var isToast: Bool {
+        toastMessage != nil
+    }
 
     public static let hidden = RecordingOverlayState(
         isVisible: false,
@@ -117,7 +145,8 @@ public struct RecordingOverlayState: Equatable, Sendable {
         statusText: "",
         isCompilingMetalShaders: false,
         activeDeviceName: nil,
-        noticeText: nil
+        noticeText: nil,
+        toastMessage: nil
     )
 
     public init(
@@ -130,7 +159,8 @@ public struct RecordingOverlayState: Equatable, Sendable {
         statusText: String,
         isCompilingMetalShaders: Bool = false,
         activeDeviceName: String? = nil,
-        noticeText: String? = nil
+        noticeText: String? = nil,
+        toastMessage: String? = nil
     ) {
         self.isVisible = isVisible
         self.phase = phase
@@ -142,6 +172,7 @@ public struct RecordingOverlayState: Equatable, Sendable {
         self.isCompilingMetalShaders = isCompilingMetalShaders
         self.activeDeviceName = activeDeviceName
         self.noticeText = noticeText
+        self.toastMessage = toastMessage
     }
 }
 
@@ -185,11 +216,13 @@ public struct AppStateSnapshot: Equatable, Sendable {
     public let preferredLanguage: String
     public let inputMode: TextInputMode
     public let playFeedbackSounds: Bool
+    public let modelIdleUnloadPolicy: ModelIdleUnloadPolicy
     public let launchAtLogin: LaunchAtLoginState
     public let permissions: PermissionSnapshot
     public let overlay: RecordingOverlayState
     public let recovery: RecoveryPayload?
     public let hasLastCommittedText: Bool
+    public let recentHistory: [RecentTranscriptEntry]
     public let isCoolingDown: Bool
 
     public var activeModel: ModelDescriptor? {
@@ -217,11 +250,13 @@ public struct AppStateSnapshot: Equatable, Sendable {
         preferredLanguage: String = "auto",
         inputMode: TextInputMode = .directTyping,
         playFeedbackSounds: Bool = true,
+        modelIdleUnloadPolicy: ModelIdleUnloadPolicy = .twoMinutes,
         launchAtLogin: LaunchAtLoginState = .unavailable,
         permissions: PermissionSnapshot = PermissionSnapshot(),
         overlay: RecordingOverlayState = .hidden,
         recovery: RecoveryPayload? = nil,
         hasLastCommittedText: Bool = false,
+        recentHistory: [RecentTranscriptEntry] = [],
         isCoolingDown: Bool = false
     ) {
         self.phase = phase
@@ -243,11 +278,13 @@ public struct AppStateSnapshot: Equatable, Sendable {
         self.preferredLanguage = preferredLanguage
         self.inputMode = inputMode
         self.playFeedbackSounds = playFeedbackSounds
+        self.modelIdleUnloadPolicy = modelIdleUnloadPolicy
         self.launchAtLogin = launchAtLogin
         self.permissions = permissions
         self.overlay = overlay
         self.recovery = recovery
-        self.hasLastCommittedText = hasLastCommittedText
+        self.hasLastCommittedText = hasLastCommittedText || !recentHistory.isEmpty
+        self.recentHistory = recentHistory
         self.isCoolingDown = isCoolingDown
     }
 }
@@ -268,6 +305,7 @@ public enum AppActionCommand: Sendable {
     case setPreferredLanguage(String)
     case setTextInputMode(TextInputMode)
     case setPlayFeedbackSounds(Bool)
+    case setModelIdleUnloadPolicy(ModelIdleUnloadPolicy)
     case setPasteRestoreDelayMs(Int)
     case setLaunchAtLogin(Bool)
     case openLoginItemsSettings
@@ -275,6 +313,8 @@ public enum AppActionCommand: Sendable {
     case openConfigFile(ConfigFileTarget)
     case saveVocabularyAndAliases(vocabText: String, aliasesJSON: String)
     case copyLastCommittedText
+    case copyHistoryItem(id: UUID)
+    case clearRecentHistory
     case recoveryCopy
     case recoveryPasteToFrontmost
     case recoveryRetry

@@ -159,6 +159,7 @@ private final class MockFocusMonitor: FocusMonitoring, @unchecked Sendable {
     var targetBundleID: String? = "com.apple.TextEdit"
     var autoAXSuccess: Bool = true
     var isSecureTextField: Bool = false
+    var isNonEditableSurface: Bool = false
     private var activeHandler: (@Sendable (FocusEvent) -> Void)?
 
     var currentFocusGeneration: UInt64 {
@@ -212,6 +213,11 @@ private final class MockFocusMonitor: FocusMonitoring, @unchecked Sendable {
     func isCurrentFocusedElementSecureTextField() -> Bool {
         lock.lock(); defer { lock.unlock() }
         return isSecureTextField
+    }
+
+    func isCurrentFocusedElementKnownNonEditable(bundleIdentifier: String?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return isNonEditableSurface
     }
 
     func frontmostPID() -> pid_t? {
@@ -632,9 +638,9 @@ struct RequestCoordinatorTests {
         #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
     }
 
-    @Test("Direct typing routes partiallyInserted remainingText and blocked outcomes to RecoveryPanel without touching clipboard")
-    func testDirectTypingPartialAndBlockedRouteToRecovery() async throws {
-        // 1. Mid-stream focus change -> partiallyInserted(remainingText)
+    @Test("Direct typing routes partiallyInserted remainingText and blocked outcomes to auto-copy + bottom toast without RecoveryPanel")
+    func testDirectTypingPartialAndBlockedRouteToAutoCopyToast() async throws {
+        // 1. Mid-stream focus change -> partiallyInserted(remainingText) auto-copies & shows toast
         do {
             let h = try CoordinatorHarness(inputMode: .directTyping)
             defer { h.cleanup() }
@@ -654,20 +660,16 @@ struct RequestCoordinatorTests {
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "前半句剩余文字")
 
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-            #expect(h.clipboard.preparePasteCallCount == 0)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "剩余文字")
-            #expect(h.coordinator.shouldInterceptCancelEscape.load() == false)
-
-            // Clicking [插入当前窗口] in directTyping mode uses directInjector (still 0 clipboard calls!)
-            h.direct.setOutcome(.inserted(method: .unicodeKeystrokeStream))
-            h.coordinator.recoveryPasteToFrontmost()
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
-            #expect(h.direct.insertedTexts.last == "剩余文字")
             #expect(h.clipboard.preparePasteCallCount == 0)
+            #expect(h.clipboard.copiedUserTexts == ["剩余文字"])
+            #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
+            #expect(h.coordinator.currentSnapshotDelta().recentHistory.first?.text == "剩余文字")
+            #expect(h.coordinator.shouldInterceptCancelEscape.load() == false)
         }
 
-        // 2. Blocked outcome routes full text to RecoveryPanel
+        // 2. Blocked outcome auto-copies full text & shows toast without RecoveryPanel
         do {
             let h = try CoordinatorHarness(inputMode: .directTyping)
             defer { h.cleanup() }
@@ -687,9 +689,12 @@ struct RequestCoordinatorTests {
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "Blocked text")
 
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
             #expect(h.clipboard.preparePasteCallCount == 0)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Blocked text")
+            #expect(h.clipboard.copiedUserTexts == ["Blocked text"])
+            #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
+            #expect(h.coordinator.currentSnapshotDelta().recentHistory.first?.text == "Blocked text")
         }
     }
 
@@ -717,8 +722,8 @@ struct RequestCoordinatorTests {
         #expect(h.direct.insertedTexts.isEmpty)
     }
 
-    @Test("Async AwaitingPreCommitReadiness waits BEFORE typing or writing clipboard; HID timeout never pollutes clipboard")
-    func testPreCommitWaitNeverPollutesClipboardOnHIDTimeout() async throws {
+    @Test("Async AwaitingPreCommitReadiness auto-copies with toast on HID timeout without synthetic Cmd+V")
+    func testPreCommitWaitAutoCopiesWithToastOnHIDTimeout() async throws {
         let h = try CoordinatorHarness(inputMode: .clipboardCompatibility)
         defer { h.cleanup() }
 
@@ -739,16 +744,16 @@ struct RequestCoordinatorTests {
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
         h.worker.completeLastTranscription(text: "Keep clipboard clean")
 
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-        // Clipboard MUST NOT have been written at all!
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
         #expect(h.clipboard.preparePasteCallCount == 0)
         #expect(h.clipboard.dispatchPasteTexts.isEmpty)
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Keep clipboard clean")
-        // Escape intercept MUST be false while RecoveryPanel is shown!
+        #expect(h.clipboard.copiedUserTexts == ["Keep clipboard clean"])
+        #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+        #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         #expect(h.coordinator.shouldInterceptCancelEscape.load() == false)
     }
 
-    @Test("Commit arbiter rejects clipboard changeCount drift in compatibility mode, calls restoreIfOwned, and routes to RecoveryPanel")
+    @Test("Commit arbiter rejects clipboard changeCount drift in compatibility mode, restores, and auto-copies with toast")
     func testCommitArbiterChangeCountInvariant() async throws {
         let h = try CoordinatorHarness(inputMode: .clipboardCompatibility)
         defer { h.cleanup() }
@@ -769,21 +774,25 @@ struct RequestCoordinatorTests {
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
         h.worker.completeLastTranscription(text: "Sensitive text")
 
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
         #expect(h.clipboard.restoreIfOwnedCallCount == 1)
         #expect(h.clipboard.dispatchPasteTexts.isEmpty)
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Sensitive text")
+        // Must NOT overwrite the user's drifted clipboard; text is safely kept in 5-item history!
+        #expect(h.clipboard.copiedUserTexts.isEmpty)
+        #expect(h.coordinator.currentSnapshotDelta().recentHistory.first?.text == "Sensitive text")
+        #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+        #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
     }
 
-    @Test("Commit arbiter rejects focus invalidation, terminal newline, and Secure Input")
+    @Test("Commit arbiter blocks different-app switch, terminal newline, and Secure Input via auto-copy + toast")
     func testCommitArbiterFocusAndTerminalGuards() async throws {
-        // 1. Focus invalidation
+        // 1. Switched to a different app -> auto-copy + toast, zero insertion into wrong app
         do {
             let h = try CoordinatorHarness()
             defer { h.cleanup() }
             h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
-            h.focus.invalidateFocus(reason: "switched window")
+            h.focus.setFrontmost(pid: 888, bundleID: "com.apple.Safari")
             let capID = try #require(h.audio.startedIdentities.first)
             h.audio.emitCompleted(AudioCaptureResult(
                 identity: capID,
@@ -795,12 +804,14 @@ struct RequestCoordinatorTests {
             ))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "Do not paste into wrong window")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-            #expect(h.clipboard.preparePasteCallCount == 0)
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+            #expect(h.direct.insertedTexts.isEmpty)
             #expect(h.clipboard.dispatchPasteTexts.isEmpty)
+            #expect(h.clipboard.copiedUserTexts == ["Do not paste into wrong window"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
 
-        // 2. Terminal safety blocks newline
+        // 2. Terminal safety blocks newline -> auto-copy + toast
         do {
             let h = try CoordinatorHarness()
             defer { h.cleanup() }
@@ -818,12 +829,14 @@ struct RequestCoordinatorTests {
             ))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "rm -rf /\n")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-            #expect(h.clipboard.preparePasteCallCount == 0)
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+            #expect(h.direct.insertedTexts.isEmpty)
             #expect(h.clipboard.dispatchPasteTexts.isEmpty)
+            #expect(h.clipboard.copiedUserTexts == ["rm -rf /\n"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
 
-        // 3. Secure Input blocks auto-paste
+        // 3. Secure Input blocks auto-paste -> auto-copy + toast
         do {
             let h = try CoordinatorHarness()
             defer { h.cleanup() }
@@ -841,8 +854,11 @@ struct RequestCoordinatorTests {
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.perms.setSecureInput(true)
             h.worker.completeLastTranscription(text: "secret")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+            #expect(h.direct.insertedTexts.isEmpty)
             #expect(h.clipboard.dispatchPasteTexts.isEmpty)
+            #expect(h.clipboard.copiedUserTexts == ["secret"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
     }
 
@@ -963,7 +979,7 @@ struct RequestCoordinatorTests {
 
     @Test("Privacy cleanup: Esc cancel, sleep/lock, and retention expiry wipe PCM and recovery text")
     func testPrivacyCleanupAndTimers() async throws {
-        // 1. Recovery text auto-expires after retention window
+        // 1. Recovery PCM retention auto-expires after retention window (critical memory pressure)
         let h = try CoordinatorHarness(
             timings: CoordinatorTimings(
                 toggleCooldownMs: 600,
@@ -975,6 +991,9 @@ struct RequestCoordinatorTests {
         )
         defer { h.cleanup() }
 
+        h.worker.emitPressure(.critical)
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().memoryPressure == .critical }
+
         h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
         let capID = try #require(h.audio.startedIdentities.first)
@@ -983,17 +1002,19 @@ struct RequestCoordinatorTests {
             pcm: h.validPCM(),
             durationMs: 600,
             peakDBFS: -14.0,
-            audioInterrupted: true, // forces RecoveryPanel
-            droppedFrames: 2
+            audioInterrupted: false,
+            droppedFrames: 0
         ))
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
-        h.worker.completeLastTranscription(text: "Temporary private text")
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Temporary private text")
+        #expect(h.coordinator.currentSnapshotDelta().recovery?.canRetry == true)
 
         // Auto-expires back to idle
         await h.waitUntil({ h.coordinator.currentSnapshotDelta().phase == .idle }, timeoutMs: 800)
         #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
+
+        // Restore pressure to normal for Esc test
+        h.worker.emitPressure(.normal)
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().memoryPressure == .normal }
 
         // 2. Esc immediately cancels recording & clears shouldInterceptCancelEscape
         h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 2))
@@ -1064,7 +1085,7 @@ struct RequestCoordinatorTests {
         #expect(h.coordinator.shouldInterceptCancelEscape.load() == false)
     }
 
-    @Test("Audio interruption with non-empty PCM is never discarded by short-utterance gate")
+    @Test("Audio interruption with non-empty PCM is never discarded by short-utterance gate and still inserts valid text")
     func testAudioInterruptedNotDroppedByShortGate() async throws {
         let h = try CoordinatorHarness()
         defer { h.cleanup() }
@@ -1083,11 +1104,12 @@ struct RequestCoordinatorTests {
         ))
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
         h.worker.completeLastTranscription(text: "Interrupted short clip")
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Interrupted short clip")
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+        #expect(h.direct.insertedTexts == ["Interrupted short clip"])
+        #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
     }
 
-    @Test("Re-pressing modifier during clipboard whenIdle wait re-checks live HID before touching clipboard")
+    @Test("Re-pressing modifier during clipboard whenIdle wait re-checks live HID and auto-copies with toast")
     func testLiveHIDRecheckWhenClipboardBecomesIdle() async throws {
         let h = try CoordinatorHarness(
             inputMode: .clipboardCompatibility,
@@ -1123,15 +1145,17 @@ struct RequestCoordinatorTests {
         h.hotkey.setHIDModifiersClear(false)
         h.clipboard.setBusy(false)
 
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-        // Because live HID was re-checked, clipboard was NEVER written!
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+        // Because live HID was re-checked, synthetic Cmd+V was NEVER posted; text was auto-copied with toast.
         #expect(h.clipboard.preparePasteCallCount == 0)
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Wait for modifier release")
+        #expect(h.clipboard.dispatchPasteTexts.isEmpty)
+        #expect(h.clipboard.copiedUserTexts == ["Wait for modifier release"])
+        #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
     }
 
-    @Test("P0-4 & P1-1: recoveryPasteToFrontmost keeps Recovery visible on failed paste and uses prePostGuard")
-    func testRecoveryPasteKeepsPanelOnFailureAndEvaluatesPrePostGuard() async throws {
-        let h = try CoordinatorHarness(inputMode: .clipboardCompatibility)
+    @Test("Minor audio droppedFrames without interruption still proceeds to normal direct insertion")
+    func testMinorDroppedFramesStillProceedsToInsertion() async throws {
+        let h = try CoordinatorHarness(inputMode: .directTyping)
         defer { h.cleanup() }
 
         h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
@@ -1142,27 +1166,14 @@ struct RequestCoordinatorTests {
             pcm: h.validPCM(),
             durationMs: 500,
             peakDBFS: -14.0,
-            audioInterrupted: true,
-            droppedFrames: 1
+            audioInterrupted: false,
+            droppedFrames: 3
         ))
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
-        h.worker.completeLastTranscription(text: "Keep me safe")
-        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
-
-        // Failure on synthetic paste MUST keep RecoveryPanel intact with text!
-        h.clipboard.dispatchPasteSucceeds = false
-        h.coordinator.recoveryPasteToFrontmost()
-        try? await Task.sleep(for: .milliseconds(50))
-        #expect(h.clipboard.prePostGuardEvaluatedCount == 1)
-        #expect(h.coordinator.currentSnapshotDelta().phase == .recovery)
-        #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Keep me safe")
-
-        // Succeeding clears RecoveryPanel and records lastCommittedText!
-        h.clipboard.dispatchPasteSucceeds = true
-        h.coordinator.recoveryPasteToFrontmost()
+        h.worker.completeLastTranscription(text: "Keep me flowing")
         await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+        #expect(h.direct.insertedTexts == ["Keep me flowing"])
         #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
-        #expect(h.coordinator.currentSnapshotDelta().hasLastCommittedText == true)
     }
 
     @Test("P0-1 UX safety: lastCommittedText can be copied from menu and wipes on lock/sleep/quit")
@@ -1261,7 +1272,7 @@ struct RequestCoordinatorTests {
             #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
         }
 
-        // 2. Direct typing with axInitialized == false STILL blocks if focusGeneration changed
+        // 2. Same-app focus churn (frontmost PID unchanged) STILL proceeds smoothly to direct insertion
         do {
             let h = try CoordinatorHarness(inputMode: .directTyping)
             defer { h.cleanup() }
@@ -1269,7 +1280,7 @@ struct RequestCoordinatorTests {
 
             h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
-            h.focus.invalidateFocus(reason: "switched window")
+            h.focus.invalidateFocus(reason: "same-app subview churn")
             let capID = try #require(h.audio.startedIdentities.first)
             h.audio.emitCompleted(AudioCaptureResult(
                 identity: capID,
@@ -1280,14 +1291,14 @@ struct RequestCoordinatorTests {
                 droppedFrames: 0
             ))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
-            h.worker.completeLastTranscription(text: "Should stay in recovery")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            h.worker.completeLastTranscription(text: "Same app stays flowing")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
 
-            #expect(h.direct.insertedTexts.isEmpty)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Should stay in recovery")
+            #expect(h.direct.insertedTexts == ["Same app stays flowing"])
+            #expect(h.coordinator.currentSnapshotDelta().recovery == nil)
         }
 
-        // 3. Direct typing with axInitialized == false STILL blocks if frontmost PID changed
+        // 3. Direct typing with axInitialized == false STILL blocks if frontmost PID changed -> auto-copy + toast
         do {
             let h = try CoordinatorHarness(inputMode: .directTyping)
             defer { h.cleanup() }
@@ -1307,13 +1318,14 @@ struct RequestCoordinatorTests {
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.focus.setFrontmost(pid: 777, bundleID: "com.apple.Safari", secure: false, axOk: false)
             h.worker.completeLastTranscription(text: "Wrong frontmost app")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
 
             #expect(h.direct.insertedTexts.isEmpty)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Wrong frontmost app")
+            #expect(h.clipboard.copiedUserTexts == ["Wrong frontmost app"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
 
-        // 4. Direct typing with axInitialized == false STILL blocks if secure text field is active
+        // 4. Direct typing with axInitialized == false STILL blocks if secure text field is active -> auto-copy + toast
         do {
             let h = try CoordinatorHarness(inputMode: .directTyping)
             defer { h.cleanup() }
@@ -1332,13 +1344,14 @@ struct RequestCoordinatorTests {
             ))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "Password field text")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
 
             #expect(h.direct.insertedTexts.isEmpty)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Password field text")
+            #expect(h.clipboard.copiedUserTexts == ["Password field text"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
 
-        // 5. Clipboard compatibility mode STILL requires axInitialized == true
+        // 5. Clipboard compatibility mode STILL requires axInitialized == true -> auto-copy + toast
         do {
             let h = try CoordinatorHarness(inputMode: .clipboardCompatibility)
             defer { h.cleanup() }
@@ -1357,11 +1370,96 @@ struct RequestCoordinatorTests {
             ))
             await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
             h.worker.completeLastTranscription(text: "Legacy app fallback")
-            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recovery }
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
 
             #expect(h.clipboard.preparePasteCallCount == 0)
-            #expect(h.coordinator.currentSnapshotDelta().recovery?.text == "Legacy app fallback")
+            #expect(h.clipboard.copiedUserTexts == ["Legacy app fallback"])
+            #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
         }
+    }
+
+    @Test("Known non-editable surface (e.g. Finder Desktop) skips typing and auto-copies with toast")
+    func testNonEditableSurfaceAutoCopiesWithToast() async throws {
+        let h = try CoordinatorHarness(inputMode: .directTyping)
+        defer { h.cleanup() }
+        h.focus.setFrontmost(pid: 500, bundleID: "com.apple.finder")
+        h.focus.isNonEditableSurface = true
+
+        h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: 1))
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+        let capID = try #require(h.audio.startedIdentities.first)
+        h.audio.emitCompleted(AudioCaptureResult(
+            identity: capID,
+            pcm: h.validPCM(),
+            durationMs: 500,
+            peakDBFS: -14.0,
+            audioInterrupted: false,
+            droppedFrames: 0
+        ))
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+        h.worker.completeLastTranscription(text: "桌面随口说一句")
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+
+        #expect(h.direct.insertedTexts.isEmpty)
+        #expect(h.clipboard.copiedUserTexts == ["桌面随口说一句"])
+        #expect(h.coordinator.currentSnapshotDelta().overlay.isToast == true)
+        #expect(h.coordinator.currentSnapshotDelta().overlay.toastMessage == "未在输入框 · 已复制到剪贴板")
+        #expect(h.coordinator.currentSnapshotDelta().recentHistory.first?.text == "桌面随口说一句")
+    }
+
+    @Test("Recent 5-item in-memory history caps at 5, supports copy/clear, and wipes on sleep/lock")
+    func testRecentHistoryFiveItemCapCopyClearAndSleepWipe() async throws {
+        let h = try CoordinatorHarness(inputMode: .directTyping)
+        defer { h.cleanup() }
+
+        for i in 1...6 {
+            h.coordinator.handleHotkeyEvent(.triggerToggle(gestureGeneration: UInt64(i * 2 - 1)))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .recording }
+            let capID = try #require(h.audio.startedIdentities.last)
+            h.audio.emitCompleted(AudioCaptureResult(
+                identity: capID,
+                pcm: h.validPCM(),
+                durationMs: 500,
+                peakDBFS: -14.0,
+                audioInterrupted: false,
+                droppedFrames: 0
+            ))
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .transcribing }
+            h.worker.completeLastTranscription(text: "第 \(i) 条识别")
+            await h.waitUntil { h.coordinator.currentSnapshotDelta().phase == .idle }
+        }
+
+        let history = h.coordinator.currentSnapshotDelta().recentHistory
+        #expect(history.count == 5)
+        #expect(history.map(\.text) == ["第 6 条识别", "第 5 条识别", "第 4 条识别", "第 3 条识别", "第 2 条识别"])
+
+        // Copy specific older item (3rd item -> "第 4 条识别")
+        let targetEntry = history[2]
+        h.coordinator.copyHistoryItem(id: targetEntry.id)
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(h.clipboard.copiedUserTexts.last == "第 4 条识别")
+
+        // Clear manually
+        h.coordinator.clearRecentHistory()
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(h.coordinator.currentSnapshotDelta().recentHistory.isEmpty)
+        #expect(h.coordinator.currentSnapshotDelta().hasLastCommittedText == false)
+    }
+
+    @Test("Secure Input activation pauses coordinator and secureInputEnded clears pause immediately")
+    func testSecureInputEndedClearsPauseState() async throws {
+        let h = try CoordinatorHarness()
+        defer { h.cleanup() }
+
+        h.perms.setSecureInput(true)
+        h.coordinator.handleHotkeyEvent(.systemReset(reason: "secureInputActivated"))
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().isSecureInputPaused == true }
+        #expect(h.coordinator.currentSnapshotDelta().isSecureInputPaused == true)
+
+        h.perms.setSecureInput(false)
+        h.coordinator.handleHotkeyEvent(.secureInputEnded)
+        await h.waitUntil { h.coordinator.currentSnapshotDelta().isSecureInputPaused == false }
+        #expect(h.coordinator.currentSnapshotDelta().isSecureInputPaused == false)
     }
 
     @Test("Perceptual dBFS audio level mapping stays calm in silence and responds strongly to normal speech")
