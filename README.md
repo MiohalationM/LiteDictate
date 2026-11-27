@@ -70,7 +70,7 @@
     <td align="center" colspan="2">
       <img src="docs/images/settings-dict-perms.png" width="540" alt="常用词、自动纠错与系统权限" />
       <br />
-      <sub><strong>常用词库与权限面板</strong> · 专业术语提示、自动纠错映射与一站式系统权限引导</sub>
+      <sub><strong>常用词库与权限</strong> · 常用词、自动纠错与系统权限管理</sub>
     </td>
   </tr>
 </table>

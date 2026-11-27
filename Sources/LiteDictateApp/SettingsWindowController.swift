@@ -210,6 +210,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var hotkeyRecorder: HotkeyRecorderButton?
     private var vocabTextView: NSTextView?
     private var aliasesTextView: NSTextView?
+    private var footerDivider: NSBox?
     private var statusFooterLabel: NSTextField?
     private var hasUnsavedDictEdits: Bool = false
 
@@ -302,6 +303,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         contentContainer = nil
         segmentedTabs = nil
         statusFooterLabel = nil
+        footerDivider = nil
         window?.contentView = nil
         window?.delegate = nil
         onDidClose()
@@ -371,20 +373,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         window.contentView = root
         self.segmentedTabs = tabs
         self.contentContainer = container
+        self.footerDivider = footerDivider
         self.statusFooterLabel = footer
         updateStatusFooter()
     }
 
     private func updateStatusFooter() {
         if let err = snapshot.lastErrorMessage, !err.isEmpty {
+            footerDivider?.isHidden = false
+            statusFooterLabel?.isHidden = false
             statusFooterLabel?.stringValue = "⚠ \(err)"
             statusFooterLabel?.textColor = .systemOrange
         } else if let notice = snapshot.lastNoticeMessage, !notice.isEmpty {
+            footerDivider?.isHidden = false
+            statusFooterLabel?.isHidden = false
             statusFooterLabel?.stringValue = notice
             statusFooterLabel?.textColor = .secondaryLabelColor
         } else {
-            statusFooterLabel?.stringValue = "言落 LiteDictate · 完全本地离线识别，不上传任何语音与文字"
-            statusFooterLabel?.textColor = .secondaryLabelColor
+            footerDivider?.isHidden = true
+            statusFooterLabel?.isHidden = true
+            statusFooterLabel?.stringValue = ""
         }
     }
 

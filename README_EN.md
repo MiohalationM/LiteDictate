@@ -70,7 +70,7 @@
     <td align="center" colspan="2">
       <img src="docs/images/settings-dict-perms.png" width="540" alt="Vocabulary, Aliases & Permissions" />
       <br />
-      <sub><strong>Dictionary & Permissions</strong> · Custom vocabulary, auto-corrections & guided TCC setup</sub>
+      <sub><strong>Dictionary & Permissions</strong> · Custom words, auto-corrections & permissions</sub>
     </td>
   </tr>
 </table>
