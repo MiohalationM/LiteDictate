@@ -889,10 +889,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         let p = snapshot.permissions
         let rows: [(String, Bool, Selector)] = [
-            ("麦克风（用于收音）", p.microphone == .granted, p.microphone == .granted ? #selector(onOpenMicSettings) : #selector(onRequestMicPermission)),
-            ("快捷键监听（全局呼出言落）", p.listenEventAccess, p.listenEventAccess ? #selector(onOpenInputMonitoringSettings) : #selector(onRequestInputMonitoring)),
-            ("自动输入文字（把识别结果打进输入框）", p.postEventAccess, p.postEventAccess ? #selector(onOpenAccessibilitySettings) : #selector(onRequestPostEvent)),
-            ("识别当前输入框（防止误输到别的窗口）", p.accessibilityTrusted, p.accessibilityTrusted ? #selector(onOpenAccessibilitySettings) : #selector(onRequestAccessibility)),
+            ("麦克风", p.microphone == .granted, p.microphone == .granted ? #selector(onOpenMicSettings) : #selector(onRequestMicPermission)),
+            ("快捷键监听", p.listenEventAccess, p.listenEventAccess ? #selector(onOpenInputMonitoringSettings) : #selector(onRequestInputMonitoring)),
+            ("自动输入文字", p.postEventAccess, p.postEventAccess ? #selector(onOpenAccessibilitySettings) : #selector(onRequestPostEvent)),
+            ("识别当前输入框", p.accessibilityTrusted, p.accessibilityTrusted ? #selector(onOpenAccessibilitySettings) : #selector(onRequestAccessibility)),
         ]
 
         for (title, granted, action) in rows {
