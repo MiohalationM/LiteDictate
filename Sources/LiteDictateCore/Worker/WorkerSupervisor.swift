@@ -261,9 +261,9 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (WorkerSupervisorEvent) -> Void) {
-        supervisorQueue.async {
-            self.eventHandler = handler
-        }
+        stateLock.lock()
+        eventHandler = handler
+        stateLock.unlock()
     }
 
     // MARK: - Public API
@@ -1208,6 +1208,9 @@ public final class WorkerSupervisor: WorkerSupervising, ModelProbing, @unchecked
     }
 
     private func emit(_ event: WorkerSupervisorEvent) {
-        eventHandler?(event)
+        stateLock.lock()
+        let handler = eventHandler
+        stateLock.unlock()
+        handler?(event)
     }
 }

@@ -4,6 +4,14 @@ import Testing
 
 @Suite("WorkerSupervisor, WarmLeakDetector & Memory Pressure Matrix")
 struct WorkerSupervisorAndMemoryTests {
+    private func waitUntil(_ condition: () -> Bool, timeoutMs: Int = 5_000) async {
+        let attempts = max(1, timeoutMs / 15)
+        for _ in 0..<attempts {
+            if condition() { return }
+            try? await Task.sleep(for: .milliseconds(15))
+        }
+    }
+
     @Test("WarmLeakDetector computes runs 3-5 median baseline and triggers after 3 consecutive +50MB & init drift strikes")
     func testWarmLeakDetector() {
         var detector = WarmLeakDetector()
@@ -68,7 +76,7 @@ struct WorkerSupervisorAndMemoryTests {
         // Under .warning, predictive warmup is paused (never tries to start)
         supervisor.handleMemoryPressure(.warning)
         supervisor.prepareWarmupIfAllowed(model: model)
-        try? await Task.sleep(for: .milliseconds(30))
+        await waitUntil { supervisor.currentMemoryPressure == .warning }
         #expect(supervisor.currentMemoryPressure == .warning)
         #expect(supervisor.currentState == .stopped)
 
@@ -80,7 +88,7 @@ struct WorkerSupervisorAndMemoryTests {
             pcm: PCMStore(sampleRate: 16_000, samples: [Float](repeating: 0.2, count: 3200))
         )
         supervisor.submitTranscription(req)
-        try? await Task.sleep(for: .milliseconds(50))
+        await waitUntil { criticalAbortReceived.load(ordering: .acquire) }
 
         #expect(criticalAbortReceived.load(ordering: .acquire) == true)
         #expect(supervisor.currentState == .stopped)
@@ -196,12 +204,7 @@ struct WorkerSupervisorAndMemoryTests {
         )
         supervisor.submitTranscription(req)
 
-        for _ in 0..<40 {
-            if failureCount.load() >= 1 && supervisor.currentState == .stopped {
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitUntil({ failureCount.load() >= 1 && supervisor.currentState == .stopped }, timeoutMs: 5_000)
         try? await Task.sleep(for: .milliseconds(100))
 
         #expect(failureCount.load() == 1)
@@ -241,7 +244,7 @@ struct WorkerSupervisorAndMemoryTests {
         let smallFile = tmpDir.appendingPathComponent("small.gguf")
         try Data("ok".utf8).write(to: smallFile)
         supervisor.handleMemoryPressure(.critical)
-        try? await Task.sleep(for: .milliseconds(30))
+        await waitUntil { supervisor.currentMemoryPressure == .critical }
 
         let critResult: Result<LDPProbeResultPayload, ModelProbeError> = await withCheckedContinuation { cont in
             supervisor.probeModel(at: smallFile.path) { cont.resume(returning: $0) }
@@ -326,19 +329,13 @@ struct WorkerSupervisorAndMemoryTests {
             pcm: PCMStore(sampleRate: 16_000, samples: [Float](repeating: 0.1, count: 1600))
         ))
 
-        for _ in 0..<60 {
-            if startedBusy.load() { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitUntil({ startedBusy.load() }, timeoutMs: 6_000)
         #expect(startedBusy.load() == true)
 
         // Trigger .warning while worker is .busy -> after 3s grace, emits transcriptionFailed (non-critical)!
         supervisor.handleMemoryPressure(.warning)
 
-        for _ in 0..<180 {
-            if gotWarningFailure.load() { break }
-            try? await Task.sleep(for: .milliseconds(25))
-        }
+        await waitUntil({ gotWarningFailure.load() }, timeoutMs: 8_000)
         #expect(gotWarningFailure.load() == true)
     }
 }

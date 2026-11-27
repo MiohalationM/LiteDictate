@@ -45,9 +45,9 @@
 - **Single-Modifier Push-to-Talk with Chord Guard**
   Hold **Right `⌘`** to speak and release to insert text. A `130 ms` chord guard keeps `Right ⌘ + C/V/Tab` completely untouched, and pressing `Esc` while holding cancels immediately. Record any custom single-modifier key (`Right ⌘`, `Right ⌥`, `Fn`, etc.) or combo (`⌘⇧D`, `⌥Space`) in Preferences.
 - **Non-Intrusive Auto-Copy Toast & 5-Item In-Memory History**
-  When no text field is focused, you switch apps, or Secure Input is active, LiteDictate automatically copies the transcript and shows a 2.5-second bottom toast instead of blocking modal popups. Keeps up to 5 recent transcripts in RAM only (zero disk writes, zero logs, wiped on lock/sleep/quit).
-- **100% Offline, Bring Your Own GGUF Model**
-  Powered by `transcribe.cpp` with Metal GPU acceleration. Import any local `.gguf` speech model (Qwen3-ASR, Whisper, SenseVoice, Parakeet, etc.) by reference without duplicating files, plus custom vocabulary and alias rules.
+  When no text field is focused, you switch apps, or Secure Input is active, LiteDictate automatically copies the transcript and shows a 2.5-second bottom toast instead of blocking modal popups. Keeps up to 5 recent transcripts in RAM only (never persisted to disk, wiped on lock/sleep/quit).
+- **Offline Speech Recognition — Import Local Open-Source Models**
+  The app bundle ships without pre-bundled weights and runs offline. Powered by `transcribe.cpp` with Metal GPU acceleration, you can download and import any local `.gguf` speech model (Qwen3-ASR, Whisper, SenseVoice, Parakeet, etc.) by reference without duplicating files, plus custom vocabulary and alias rules.
 
 ---
 
@@ -99,7 +99,7 @@ Benchmarked on Apple M1 · 8 GB unified RAM · macOS 14+ · `Qwen3-ASR-0.6B-Q8_0
 3. Click the menu bar icon to grant **Microphone**, **Accessibility**, and **Input Monitoring** permissions, then import the `.gguf` file in **Preferences → Models** (or drop it into `~/Library/Application Support/LiteDictate/models/` for automatic detection).
 4. **Hold Right `⌘`** anywhere to speak and release to insert text (press `Esc` to cancel).
 
-> **First launch**: If macOS Gatekeeper warns about an unnotarized open-source build, run once in Terminal:
+> **Community Open-Source Build & First Launch**: Release DMGs are community open-source builds without Apple Developer ID notarization. If macOS Gatekeeper warns on first launch, run once in Terminal:
 > ```bash
 > xattr -cr /Applications/LiteDictate.app
 > ```
@@ -129,5 +129,8 @@ Artifacts are written to `Build/LiteDictate.app`, `Build/LiteDictate-1.1.0-arm64
 
 ## Privacy & License
 
-- **Zero network calls, zero telemetry, zero disk persistence** for audio or transcripts; all in-memory buffers and recent history are wiped on sleep, screen lock, or quit.
+- **No network calls at runtime**: LiteDictate never connects to the internet or uploads audio or transcripts.
+- **No disk persistence for audio or text**: Audio PCM, transcripts, and the 5-item recent history remain strictly in RAM and are cleared on sleep, screen lock, or quit.
+- **Metadata-only diagnostics**: System diagnostic logs record only metadata such as injection method, target bundle ID, and character count — never audio or transcript text.
+- **System clipboard behavior**: When auto-copy fallback or manual history copy writes to the system clipboard, macOS manages clipboard syncing (e.g., Universal Clipboard) per your system settings.
 - Released under the **MIT License** — see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
